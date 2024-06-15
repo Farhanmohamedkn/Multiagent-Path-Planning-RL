@@ -1,0 +1,17 @@
+#!/bin/bash
+
+#SBATCH -J mapf 
+
+#SBATCH -o job_logs/mapf-%j.out 
+
+#SBATCH -e job_logs/mapf-%j.err
+
+#SBATCH -t 2:00:00
+#SBATCH --mail-type=END      # an email is send at the end of the job
+
+#SBATCH --gres=gpu:V100:1 # select a host with a Volta GPU
+
+rhrk-singularity --list
+
+rhrk-singularity tensorflow_21.06-tf1-py3.simg python3 /home/noushad/Master_thesis/PRIMAL/DRLMAPF_A3C_RNN.py
+

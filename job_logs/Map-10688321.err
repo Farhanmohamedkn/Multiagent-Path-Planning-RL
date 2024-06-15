@@ -1,0 +1,22 @@
+Traceback (most recent call last):
+  File "/home/noushad/Master_thesis/my_PRIMAL/simple_DRLMAPF.py", line 32, in <module>
+    import mapf_gym as mapf_gym
+  File "/home/noushad/Master_thesis/my_PRIMAL/mapf_gym.py", line 14, in <module>
+    from gym.envs.classic_control import rendering  #in gym version gym version 0.21.0 it works      
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/gym/envs/classic_control/rendering.py", line 27, in <module>
+    from pyglet.gl import *
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/gl/__init__.py", line 232, in <module>
+    import pyglet.window
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/window/__init__.py", line 1919, in <module>
+    gl._create_shadow_window()
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/gl/__init__.py", line 206, in _create_shadow_window
+    _shadow_window = Window(width=1, height=1, visible=False)
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/window/xlib/__init__.py", line 171, in __init__
+    super(XlibWindow, self).__init__(*args, **kwargs)
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/window/__init__.py", line 591, in __init__
+    display = pyglet.canvas.get_display()
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/canvas/__init__.py", line 94, in get_display
+    return Display()
+  File "/home/noushad/.conda/envs/pytorch/lib/python3.9/site-packages/pyglet/canvas/xlib.py", line 123, in __init__
+    raise NoSuchDisplayException('Cannot connect to "%s"' % name)
+pyglet.canvas.xlib.NoSuchDisplayException: Cannot connect to "None"
