@@ -47,7 +47,7 @@ class ACNet(nn.Module):
         
         # LSTM layers
         self.lstmcell=nn.LSTMCell(RNN_SIZE,RNN_SIZE)
-        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE)
+        
         
         # Output layers
         self.policy_layer = nn.Linear(RNN_SIZE, a_size) #need to use normalized colmns_initializer
@@ -66,7 +66,7 @@ class ACNet(nn.Module):
                 m.bias.data.fill_(0)
     
     
-    def forward(self, inputs, goal_pos,state_init, training=True):
+    def forward(self, inputs, goal_pos, training=True):
         
 
         # inputs=torch.tensor(inputs, dtype=torch.float32,requires_grad=True)
@@ -130,12 +130,13 @@ class ACNet(nn.Module):
 
         state_init = (c_init, h_init)
 
-        hx,cx=self.lstmcell(rnn_in,state_init)
+        for i in range(rnn_in.size()[0]):
+            hx,cx=self.lstmcell(rnn_in,state_init)
 
         state_in=(hx,cx)
         
 
-        
+        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE,rnn_in.shape[0],batch_first=True)
        
         lstm_outputs, state_out = self.lstm(rnn_in, state_in) #its dynamic rnn may have to use loops for sequence length
             

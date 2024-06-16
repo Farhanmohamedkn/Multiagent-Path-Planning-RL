@@ -76,33 +76,45 @@ class Worker:
     def train(self, rollout, gamma, bootstrap_value, rnn_state0, imitation=False):
         global episode_count
         
-        
+        optimizer = torch.optim.NAdam(self.local_AC.parameters(), lr=lr)
         if imitation:
-                # rollout=np.array(rollout,dtype=object)
-                for item in rollout:
-                    inputs=torch.tensor(item[0], dtype=torch.float32)
-                    goal_pos=torch.tensor(item[1], dtype=torch.float32)
-                    # goal_pos.unsqueeze(0)
-                    # optimal_actions=torch.tensor(item[2], dtype=torch.int32)
-                
-                # optimal_actions_onehot=torch.nn.functional.one_hot(torch.tensor(optimal_actions), num_classes=a_size)
-                global_step=episode_count
-                
-
                 #we calculate the loss differently for imitation
                 #if imitation=True the rollout is assumed to have different dimensions:
                 #[o[0],o[1],optimal_actions]
-                self.local_AC.train()
-                output=self.local_AC.forward(inputs,goal_pos,rnn_state0,training=True)
+                inputs_rollout = []
+                goal_pos_rollout = []
+                optimal_actions_rollout = []
+                for item in rollout:
+                    inputs=torch.tensor(item[0], dtype=torch.float32)
+                    goal_pos=torch.tensor(item[1], dtype=torch.float32)
+                    optimal_actions=torch.tensor(item[2])
+
+                    inputs_rollout.append(inputs)
+                    goal_pos_rollout.append(goal_pos)
+                    optimal_actions_rollout.append(optimal_actions)
+                    
                 
-                _,i_l,_=sess.run([self.local_AC.policy,self.local_AC.imitation_loss,
-                                self.local_AC.apply_imitation_grads],
-                                feed_dict=feed_dict)
+                
+                global_step=episode_count
+                
+                inputs = torch.stack(inputs_rollout)
+                print("inputs shape",inputs.shape)
+                goal_pos=torch.stack(goal_pos_rollout)
+                print("goal_pos shape",goal_pos.shape)
+                
+                self.local_AC.train()
+                output=self.local_AC.forward(inputs,goal_pos,training=True)
+               
+                self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
+                self.optimal_actions  = torch.tensor(optimal_actions_rollout)
+                self.optimal_actions_onehot = torch.nn.functional.one_hot(self.optimal_actions, num_classes=a_size)
+                
+                
                 # Backward pass and optimization
                 optimizer.zero_grad()
-                i_l.backward()
+                imit_loss.backward()
                 optimizer.step()
-                return i_l
+                return imit_loss
            
         # print("Shape of rollout:_start", rollout.shape, rollout.size)
         observations_rollout = []
@@ -135,32 +147,13 @@ class Worker:
             blockings_rollout.append(blockings)
             on_goals_rollout.append(on_goals)
             train_value_rollout.append(train_value)
-
-
-        # Convert each component to a PyTorch tensor as needed
-        # rollout=np.array(rollout,dtype=object)
-        # observations =torch.stack([torch.tensor(item[0]) for item in rollout])
-        # observations = rollout[:,0]
-        # goals=torch.stack([torch.tensor(item[-2]) for item in rollout])
-        # goals=rollout[:,-2]
-        # actions = rollout[:,1]
-        # rewards = rollout[:,2]
-        
-        # values = rollout[:,5]
-        # valids = torch.stack([torch.tensor(item[6]) for item in rollout])
-        # valids = rollout[:,6]
-        # blockings = rollout[:,10]
-        # on_goals=rollout[:,8]
-        # train_value = rollout[:,-1]
             
         global_step=episode_count
 
         # Here we take the rewards and values from the rollout, and use them to 
         # generate the advantage and discounted returns. (With bootstrapping)
         # The advantage function uses "Generalized Advantage Estimation"
-        # rewards_tensor = rewards_rollout
-        # bootstrap_value_tensor = torch.tensor([bootstrap_value], dtype=torch.float32)
-        # self.rewards_plus =rewards_rollout+[bootstrap_value]
+        
         rewards=np.array(rewards_rollout,dtype=object)
         if torch.is_tensor(bootstrap_value):
             bootstrap_value = bootstrap_value.detach().numpy()
@@ -176,56 +169,60 @@ class Worker:
         advantages = rewards + gamma * self.value_plus[1:] - self.value_plus[:-1]
         advantages = good_discount(advantages,gamma)
 
+
         num_samples = min(EPISODE_SAMPLES,len(advantages))
         sampleInd = np.sort(np.random.choice(advantages.shape[0], size=(num_samples,), replace=False))
+        advantages=np.array(advantages, dtype=np.float32)
 
-        # Update the global network using gradients from loss
-        # Generate network statistics to periodically save
+        
         observations = torch.stack(observations_rollout)
         goals=torch.stack(goals_rollout)
 
-        output=self.local_AC.forward(observations,goals,rnn_state0,training=True)
-        self.policy, self.value, self.state_in,self.state_out, self.blocking, self.on_goal,self.policy_sig=output
-
-        self.target_v   = discounted_rewards
-        self.actions  = actions
-        self.actions_onehot = torch.nn.functional.one_hot(self.actions, num_classes=a_size)
-        self.train_valid = valids
-        self.advantages= advantages
-        self.train_value=train_value
-        self.target_blockings=blockings
-        self.target_on_goals =on_goals
-
-
-
-        # feed_dict = {
-        #     global_step:episode_count,
-        #     self.local_AC.target_v:np.stack(discounted_rewards),
-        #     self.local_AC.inputs:np.stack(observations),
-        #     self.local_AC.goal_pos:np.stack(goals),
-        #     self.local_AC.actions:actions,
-        #     self.local_AC.train_valid:np.stack(valids),
-        #     self.local_AC.advantages:advantages,
-        #     self.local_AC.train_value:train_value,
-        #     self.local_AC.target_blockings:blockings,
-        #     self.local_AC.target_on_goals:on_goals,
-        #     self.local_AC.state_in[0]:rnn_state0[0],
-        #     self.local_AC.state_in[1]:rnn_state0[1]
-        # }
+        output=self.local_AC.forward(observations,goals,training=True)
+        self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
         
-        #calculate loss and apply gradient
-        # self.policy_loss=
-        v_l,p_l,valid_l,e_l,g_n,v_n,b_l,og_l,_ = sess.run([self.local_AC.value_loss,
-            self.local_AC.policy_loss,
-            self.local_AC.valid_loss,
-            self.local_AC.entropy,
-            self.local_AC.grad_norms,
-            self.local_AC.var_norms,
-            self.local_AC.blocking_loss,
-            self.local_AC.on_goal_loss,
-            self.local_AC.apply_grads],
-            feed_dict=feed_dict)
-        return v_l/len(rollout), p_l/len(rollout), valid_l/len(rollout), e_l/len(rollout), b_l/len(rollout), og_l/len(rollout), g_n, v_n
+
+
+        self.target_v   = torch.from_numpy(discounted_rewards.copy())  #torch.tensor(discounted_rewards)
+        self.actions  = torch.tensor(actions_rollout)
+        self.actions_onehot = torch.nn.functional.one_hot(self.actions, num_classes=a_size)
+        self.train_valid = torch.stack(valids_rollout)
+        self.advantages= torch.from_numpy(advantages.copy()) #torch.tensor(advantages)
+        self.train_value=torch.stack(train_value_rollout)
+        self.target_blockings=torch.stack(blockings_rollout)
+        self.target_on_goals =torch.stack(on_goals_rollout)
+        self.responsible_outputs    = torch.sum(self.policy * self.actions_onehot)
+        length_roll=len(observations_rollout) #length of the rollouts
+        
+
+        #calculate loss
+        self.value_loss    =   torch.sum(self.train_value * torch.square((self.target_v-self.value.view(-1))))
+        self.entropy       = - torch.sum(self.policy*(torch.log((torch.clamp(self.policy, min=1e-10, max=1.0)))))
+        self.policy_loss   = - torch.sum((torch.log((torch.clamp(self.responsible_outputs, min=1e-15, max=1.0))))*self.advantages)
+        self.valid_loss    = - torch.sum(((torch.log((torch.clamp(self.policy_sig, min=1e-10, max=1.0))))*self.train_valid)+((torch.log(torch.clamp(1-self.policy_sig, min=1e-10, max=1.0)))*(1-self.train_valid)))
+        self.blocking_loss = - torch.sum(((torch.log((torch.clamp(self.blocking, min=1e-15, max=1.0))))*self.target_blockings)+((torch.log((torch.clamp(1-self.blocking, min=1e-15, max=1.0))))*(1-self.target_blockings)))
+        self.on_goal_loss  = - torch.sum(((torch.log((torch.clamp(self.on_goal, min=1e-10, max=1.0))))*self.target_on_goals)+((torch.log((torch.clamp(1-self.on_goal, min=1e-10, max=1.0))))*(1-self.target_on_goals)))
+        self.loss          = 0.5 * self.value_loss + self.policy_loss + 0.5*self.valid_loss - self.entropy * 0.01 +.5*self.blocking_loss
+        
+        #calculated loss and apply gradient
+
+        optimizer.zero_grad()
+
+
+        self.loss.backward()
+            
+           
+            
+        optimizer.step()
+        g_n=1
+        v_n=1
+        
+
+        # Update the global network using gradients from loss
+        # Generate network statistics to periodically save
+
+        
+        return self.value_loss/length_roll, self.policy_loss /length_roll, self.valid_loss/length_roll, self.entropy/length_roll, self.blocking_loss/length_roll, self.on_goal_loss/length_roll, g_n, v_n
         
 
     def shouldRun(self, coord, episode_count):
@@ -290,10 +287,20 @@ class Worker:
             p=self.env.world.getPos(self.agentID)
             on_goal               = self.env.world.goals[p[0],p[1]]==self.agentID
             s                     = self.env._observe(self.agentID)
-            c_in = torch.zeros(1, RNN_SIZE)
-            h_in = torch.zeros(1, RNN_SIZE)
-            rnn_state             =(c_in, h_in)
-            rnn_state0            = rnn_state
+            # c_in = torch.zeros(1, RNN_SIZE)
+            # h_in = torch.zeros(1, RNN_SIZE)
+            # rnn_state             =(c_in, h_in)
+            inputs=s[0] #observation #pos,goal,obs maps
+            inputs=np.array(inputs)
+            inputs=torch.tensor(inputs, dtype=torch.float32)
+            inputs=inputs.unsqueeze(0) #accodomodate batchsize
+
+            goal_pos=s[1] #dx,dy,mag
+            goal_pos=np.array(goal_pos)
+            goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
+            goal_pos=goal_pos.unsqueeze(0)
+            _, _, _,_,state_init,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
+            rnn_state0            = state_init
             RewardNb = 0 
             wrong_blocking  = 0
             wrong_on_goal=0
@@ -305,7 +312,7 @@ class Worker:
 
             # reset swarm_reward (for tensorboard)
             swarm_reward[self.metaAgentID] = 0
-            if episode_count>PRIMING_LENGTH and demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
+            if episode_count<PRIMING_LENGTH or demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
                 #for the first PRIMING_LENGTH episodes, or with a certain probability
                 #don't train on the episode and instead observe a demonstration from M*
                 if self.workerID==1 and episode_count%100==0:
@@ -359,7 +366,7 @@ class Worker:
                 
 
                 self.local_AC.eval()
-                a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state0,training=True)
+                a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
                 
                  # Check if the argmax of a_dist is in validActions
                 if not (torch.argmax(a_dist.flatten()).item() in validActions):
@@ -433,7 +440,7 @@ class Worker:
                         goal_pos=np.array(goal_pos)
                         goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
                         goal_pos=goal_pos.unsqueeze(0)
-                        _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state,training=True)
+                        _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
                         s1Values[i_buf]=s1Values[i_buf][0]
 
                         
