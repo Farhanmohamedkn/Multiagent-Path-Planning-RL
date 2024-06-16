@@ -108,13 +108,14 @@ class Worker:
                 self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
                 self.optimal_actions  = torch.tensor(optimal_actions_rollout)
                 self.optimal_actions_onehot = torch.nn.functional.one_hot(self.optimal_actions, num_classes=a_size)
+                self.imitation_loss = torch.mean(nn.CrossEntropyLoss(self.optimal_actions_onehot,self.policy)) 
                 
                 
                 # Backward pass and optimization
                 optimizer.zero_grad()
-                imit_loss.backward()
+                self.imitation_loss.backward()
                 optimizer.step()
-                return imit_loss
+                return self.imitation_loss
            
         # print("Shape of rollout:_start", rollout.shape, rollout.size)
         observations_rollout = []
