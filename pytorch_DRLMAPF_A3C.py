@@ -82,6 +82,7 @@ class Worker:
                 for item in rollout:
                     inputs=torch.tensor(item[0], dtype=torch.float32)
                     goal_pos=torch.tensor(item[1], dtype=torch.float32)
+                    # goal_pos.unsqueeze(0)
                     # optimal_actions=torch.tensor(item[2], dtype=torch.int32)
                 
                 # optimal_actions_onehot=torch.nn.functional.one_hot(torch.tensor(optimal_actions), num_classes=a_size)
@@ -349,14 +350,16 @@ class Worker:
                 inputs=s[0] #observation #pos,goal,obs maps
                 inputs=np.array(inputs)
                 inputs=torch.tensor(inputs, dtype=torch.float32)
+                inputs=inputs.unsqueeze(0) #accodomodate batchsize
 
                 goal_pos=s[1] #dx,dy,mag
                 goal_pos=np.array(goal_pos)
                 goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
+                goal_pos=goal_pos.unsqueeze(0)
                 
 
                 self.local_AC.eval()
-                a_dist, v, rnn_state,state_out,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state0,training=True)
+                a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state0,training=True)
                 
                  # Check if the argmax of a_dist is in validActions
                 if not (torch.argmax(a_dist.flatten()).item() in validActions):
@@ -425,10 +428,14 @@ class Worker:
                         inputs=s[0] #observation #pos,goal,obs maps
                         inputs=np.array(inputs)
                         inputs=torch.tensor(inputs, dtype=torch.float32) #it should be local_AC.inputs:np.array([s[0]])
+                        inputs=inputs.unsqueeze(0)
                         goal_pos=s[1] #dx,dy,mag
                         goal_pos=np.array(goal_pos)
                         goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
-                        _,s1Values[i_buf],_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state,training=True)
+                        goal_pos=goal_pos.unsqueeze(0)
+                        _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,state_init=rnn_state,training=True)
+                        s1Values[i_buf]=s1Values[i_buf][0]
+
                         
 
 
