@@ -22,6 +22,7 @@ from ACNet_pytorch_my_change import ACNet
 import torch
 import torch.optim as optim
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 
 
 RNN_SIZE = 512
@@ -85,8 +86,12 @@ class Worker:
                 goal_pos_rollout = []
                 optimal_actions_rollout = []
                 for item in rollout:
-                    inputs=torch.tensor(item[0], dtype=torch.float32)
-                    goal_pos=torch.tensor(item[1], dtype=torch.float32)
+                    
+                    inputs=torch.tensor(np.array(item[0]), dtype=torch.float32)
+                    
+                    goal_pos=torch.tensor(np.array(item[1]), dtype=torch.float32)
+                    
+                    
                     optimal_actions=torch.tensor(item[2])
 
                     inputs_rollout.append(inputs)
@@ -98,10 +103,8 @@ class Worker:
                 global_step=episode_count
                 
                 inputs = torch.stack(inputs_rollout)
-                print("inputs shape",inputs.shape)
                 goal_pos=torch.stack(goal_pos_rollout)
-                print("goal_pos shape",goal_pos.shape)
-                
+
                 self.local_AC.train()
                 output=self.local_AC.forward(inputs,goal_pos,training=True)
                
@@ -272,7 +275,7 @@ class Worker:
         episode_buffers, s1Values = [ [] for _ in range(NUM_BUFFERS) ], [ [] for _ in range(NUM_BUFFERS) ]
         
     
-        while (episode_count<=max_episode_length or d==True):
+        while (episode_count<=max_episode_length or d==True): #should implement the cordinator of thread
 
             episode_buffer, episode_values = [], []
             episode_reward = episode_step_count = episode_inv_count = 0
@@ -317,9 +320,12 @@ class Worker:
                 #for the first PRIMING_LENGTH episodes, or with a certain probability
                 #don't train on the episode and instead observe a demonstration from M*
                 if self.workerID==1 and episode_count%100==0:
+                    # Save the model state dictionary
+                    torch.save(self.local_AC.state_dict(), f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
+
+                    print(f"Model saved at {model_path}/model-{episode_count}.pt")
                     # saver.save(sess, model_path+'/model-'+str(int(episode_count))+'.cptk')
-                    # torch.save(model.state_dict(), model_path)????
-                    print("model_saved")
+                    
                 global rollouts
                 rollouts[self.metaAgentID]=None
                 if(self.agentID==1):
@@ -337,9 +343,14 @@ class Worker:
                 self.synchronize()
                 if rollouts[self.metaAgentID] is not None:
                     i_l=self.train(rollouts[self.metaAgentID][self.agentID-1], gamma, None, rnn_state0, imitation=True)
+
                     episode_count+=1./num_workers
                     if self.agentID==1:
                         print("imitation loss wrote to the summary")
+                        # Log the imitation loss with the tag 'Losses/Imitation loss'
+                        writer.add_scalar('Losses/Imitation_loss', i_l, episode_count)
+                        writer.flush()
+                        # writer.close()
                         # summary = tf.compat.v1.Summary()
                         # summary.value.add(tag='Losses/Imitation loss', simple_value=i_l)
                         # global_summary.add_summary(summary, int(episode_count))
@@ -368,7 +379,14 @@ class Worker:
 
                 self.local_AC.eval()
                 a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
-                
+
+                a_dist=a_dist.detach()
+                v=v.detach()
+                pred_blocking=pred_blocking.detach()
+                pred_on_goal=pred_on_goal.detach()
+                policy_sig=policy_sig.detach()
+
+
                  # Check if the argmax of a_dist is in validActions
                 if not (torch.argmax(a_dist.flatten()).item() in validActions):
                     episode_inv_count += 1
@@ -451,7 +469,12 @@ class Worker:
                         i_rand = np.random.randint(i_buf+1)
                     else:
                         i_rand = np.random.randint(NUM_BUFFERS)
+                        #detach each element
+                        #put together again
+                        # tmp = np.array(episode_buffers[i_rand],dtype=object)
                         tmp = np.array(episode_buffers[i_rand],dtype=object)
+
+                        # tmp=torch.sta(episode_buffers[i_rand])
                         while tmp.shape[0] == 0:
                             i_rand = np.random.randint(NUM_BUFFERS)
                             tmp = np.array(episode_buffers[i_rand])
@@ -467,6 +490,8 @@ class Worker:
                     break
 
             episode_lengths[self.metaAgentID].append(episode_step_count)
+            episode_values=[t.detach() for t in episode_values]
+
             episode_mean_values[self.metaAgentID].append(np.nanmean(episode_values))
             episode_invalid_ops[self.metaAgentID].append(episode_inv_count)
             episode_wrong_blocking[self.metaAgentID].append(wrong_blocking)
@@ -498,7 +523,7 @@ class Worker:
                 if episode_count % SUMMARY_WINDOW == 0:
                     if episode_count % 100 == 0:
                         print ('Saving Model', end='\n')
-                        saver.save(sess, model_path+'/model-'+str(int(episode_count))+'.cptk')
+                        torch.save(self.local_AC.state_dict(), f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
                         print ('Saved Model', end='\n')
                     SL = SUMMARY_WINDOW * num_workers
                     mean_reward = np.nanmean(episode_rewards[self.metaAgentID][-SL:])
@@ -506,25 +531,27 @@ class Worker:
                     mean_value = np.nanmean(episode_mean_values[self.metaAgentID][-SL:])
                     mean_invalid = np.nanmean(episode_invalid_ops[self.metaAgentID][-SL:])
                     mean_wrong_blocking = np.nanmean(episode_wrong_blocking[self.metaAgentID][-SL:])
-                    current_learning_rate = sess.run(lr,feed_dict={global_step:episode_count})
+                    # current_learning_rate = sess.run(lr,feed_dict={global_step:episode_count}) calculate current learning rate
 
-                    summary = tf.compat.v1.Summary()
-                    summary.value.add(tag='Perf/Learning Rate',simple_value=current_learning_rate)
-                    summary.value.add(tag='Perf/Reward', simple_value=mean_reward)
-                    summary.value.add(tag='Perf/Length', simple_value=mean_length)
-                    summary.value.add(tag='Perf/Valid Rate', simple_value=(mean_length-mean_invalid)/mean_length)
-                    summary.value.add(tag='Perf/Blocking Prediction Accuracy', simple_value=(mean_length-mean_wrong_blocking)/mean_length)
+                
+                    # writer.add_scalar('Perf/Learning Rate', current_learning_rate,episode_count)
+                    writer.add_scalar('Perf/Reward', mean_reward,episode_count)
+                    writer.add_scalar('Perf/Length', mean_length,episode_count)
 
-                    summary.value.add(tag='Losses/Value Loss', simple_value=v_l)
-                    summary.value.add(tag='Losses/Policy Loss', simple_value=p_l)
-                    summary.value.add(tag='Losses/Blocking Loss', simple_value=b_l)
-                    summary.value.add(tag='Losses/On Goal Loss', simple_value=og_l)
-                    summary.value.add(tag='Losses/Valid Loss', simple_value=valid_l)
-                    summary.value.add(tag='Losses/Grad Norm', simple_value=g_n)
-                    summary.value.add(tag='Losses/Var Norm', simple_value=v_n)
-                    global_summary.add_summary(summary, int(episode_count))
+                    writer.add_scalar('Perf/Valid Rate',((mean_length-mean_invalid)/mean_length),episode_count)
 
-                    global_summary.flush()
+                    writer.add_scalar('Perf/Length', ((mean_length-mean_wrong_blocking)/mean_length),episode_count)
+
+                    writer.add_scalar('Losses/Value Loss', v_l,episode_count)
+                    
+                    writer.add_scalar('Losses/Policy Loss', p_l,episode_count)
+                    writer.add_scalar('Losses/Blocking Loss', b_l,episode_count)
+                    writer.add_scalar('Losses/On Goal Loss', og_l,episode_count)
+                    writer.add_scalar('Losses/Valid Loss', valid_l,episode_count)
+                    writer.add_scalar('Losses/Grad Norm', g_n,episode_count)
+                    writer.add_scalar('Losses/Var Norm', v_n,episode_count)
+                    writer.flush()
+                    
 
                     if printQ:
                         print('{} Tensorboard updated ({})'.format(episode_count, self.workerID), end='\r')
@@ -563,14 +590,17 @@ NUM_THREADS            = 1 #int(multiprocessing.cpu_count() / (2 * NUM_META_AGEN
 
 NUM_BUFFERS            = 1 # NO EXPERIENCE REPLAY int(NUM_THREADS / 2)
 EPISODE_SAMPLES        = EXPERIENCE_BUFFER_SIZE # 64
-LR_Q                   = 2.e-5 #8.e-5 / NUM_THREADS # default: 1e-5
+LR_Q                   = 8.e-5 / NUM_THREADS # default: 1e-5
 ADAPT_LR               = True
 ADAPT_COEFF            = 5.e-5 #the coefficient A in LR_Q/sqrt(A*steps+1) for calculating LR
 load_model             = False
 RESET_TRAINER          = False
-model_path             = 'model_primal'
+model_path             = "pytorch_model"
 gifs_path              = 'gifs_primal'
-train_path             = 'train_primal'
+train_log_path         = '/home/noushad/Master_thesis/Primal_Thesis/train_log_path'
+
+writer = SummaryWriter(log_dir=train_log_path)
+
 GLOBAL_NET_SCOPE       = 'global'
 
 #Imitation options
