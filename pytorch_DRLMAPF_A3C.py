@@ -62,7 +62,11 @@ class Worker:
 
         self.nextGIF = episode_count # For GIFs output
         #Create the local copy of the network and the tensorflow op to copy global parameters to local network
-        self.local_AC = ACNet(self.name,a_size,trainer,True,GRID_SIZE,GLOBAL_NET_SCOPE) #this should be our model?
+        self.local_AC = ACNet(self.name,a_size,trainer,True,GRID_SIZE,GLOBAL_NET_SCOPE).to(device) #this should be our model?
+
+        print("Model's state_dict:")
+        for param_tensor in self.local_AC .state_dict():
+            print(param_tensor, "\t", self.local_AC .state_dict()[param_tensor].size())
         # self.pull_global = update_target_graph(GLOBAL_NET_SCOPE, self.name)
         
 
@@ -82,6 +86,7 @@ class Worker:
                 #we calculate the loss differently for imitation
                 #if imitation=True the rollout is assumed to have different dimensions:
                 #[o[0],o[1],optimal_actions]
+                print("imitation mode")
                 inputs_rollout = []
                 goal_pos_rollout = []
                 optimal_actions_rollout = []
@@ -102,8 +107,11 @@ class Worker:
                 
                 global_step=episode_count
                 
-                inputs = torch.stack(inputs_rollout)
-                goal_pos=torch.stack(goal_pos_rollout)
+                inputs = torch.stack(inputs_rollout).to(device)
+                goal_pos=torch.stack(goal_pos_rollout).to(device)
+
+                print("inputs.shape",inputs.shape)
+                print("goal_pos.shape",goal_pos.shape)
 
                 self.local_AC.train()
                 output=self.local_AC.forward(inputs,goal_pos,training=True)
@@ -111,12 +119,12 @@ class Worker:
                 self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
                 self.optimal_actions  = torch.tensor(optimal_actions_rollout)
                 self.optimal_actions_onehot = torch.nn.functional.one_hot(self.optimal_actions, num_classes=a_size)
-                self.imitation_loss = torch.mean(nn.CrossEntropyLoss(self.optimal_actions_onehot,self.policy)) 
+                # self.imitation_loss = torch.mean(nn.CrossEntropyLoss(self.optimal_actions_onehot,self.policy)) 
                 
                 
                 # Backward pass and optimization
                 optimizer.zero_grad()
-                self.imitation_loss.backward()
+                # self.imitation_loss.backward()
                 optimizer.step()
                 return self.imitation_loss
            
@@ -179,9 +187,9 @@ class Worker:
         advantages=np.array(advantages, dtype=np.float32)
 
         
-        observations = torch.stack(observations_rollout)
-        goals=torch.stack(goals_rollout)
-
+        observations = torch.stack(observations_rollout).to(device)
+        goals=torch.stack(goals_rollout).to(device)
+        self.local_AC.train()
         output=self.local_AC.forward(observations,goals,training=True)
         self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
         
@@ -275,7 +283,7 @@ class Worker:
         episode_buffers, s1Values = [ [] for _ in range(NUM_BUFFERS) ], [ [] for _ in range(NUM_BUFFERS) ]
         
     
-        while (episode_count<=max_episode_length or d==True): #should implement the cordinator of thread
+        while (episode_count<=max_episode_length): #should implement the cordinator of thread
 
             episode_buffer, episode_values = [], []
             episode_reward = episode_step_count = episode_inv_count = 0
@@ -296,14 +304,16 @@ class Worker:
             # rnn_state             =(c_in, h_in)
             inputs=s[0] #observation #pos,goal,obs maps
             inputs=np.array(inputs)
-            inputs=torch.tensor(inputs, dtype=torch.float32)
-            inputs=inputs.unsqueeze(0) #accodomodate batchsize
+            inputs=torch.tensor(inputs, dtype=torch.float32).to(device)
+            inputs=inputs.unsqueeze(0).to(device) #accodomodate batchsize
 
             goal_pos=s[1] #dx,dy,mag
             goal_pos=np.array(goal_pos)
-            goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
-            goal_pos=goal_pos.unsqueeze(0)
-            _, _, _,_,state_init,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
+            goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
+            goal_pos=goal_pos.unsqueeze(0).to(device)
+            
+            _, _, _,_,state_init,_,_,_=self.local_AC(inputs=inputs,goal_pos=goal_pos,training=True)
+            print("hello")
             rnn_state0            = state_init
             RewardNb = 0 
             wrong_blocking  = 0
@@ -316,7 +326,7 @@ class Worker:
 
             # reset swarm_reward (for tensorboard)
             swarm_reward[self.metaAgentID] = 0
-            if episode_count<PRIMING_LENGTH or demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
+            if episode_count<PRIMING_LENGTH  or demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
                 #for the first PRIMING_LENGTH episodes, or with a certain probability
                 #don't train on the episode and instead observe a demonstration from M*
                 if self.workerID==1 and episode_count%100==0:
@@ -368,17 +378,18 @@ class Worker:
                 #Take an action using probabilities from policy network output.
                 inputs=s[0] #observation #pos,goal,obs maps
                 inputs=np.array(inputs)
-                inputs=torch.tensor(inputs, dtype=torch.float32)
+                inputs=torch.tensor(inputs, dtype=torch.float32).to(device)
                 inputs=inputs.unsqueeze(0) #accodomodate batchsize
 
                 goal_pos=s[1] #dx,dy,mag
                 goal_pos=np.array(goal_pos)
-                goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
+                goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
                 goal_pos=goal_pos.unsqueeze(0)
                 
 
                 self.local_AC.eval()
-                a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
+                with torch.no_grad():
+                    a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
 
                 a_dist=a_dist.detach()
                 v=v.detach()
@@ -453,11 +464,11 @@ class Worker:
                     else:
                         inputs=s[0] #observation #pos,goal,obs maps
                         inputs=np.array(inputs)
-                        inputs=torch.tensor(inputs, dtype=torch.float32) #it should be local_AC.inputs:np.array([s[0]])
+                        inputs=torch.tensor(inputs, dtype=torch.float32).to(device) #it should be local_AC.inputs:np.array([s[0]])
                         inputs=inputs.unsqueeze(0)
                         goal_pos=s[1] #dx,dy,mag
                         goal_pos=np.array(goal_pos)
-                        goal_pos=torch.tensor(goal_pos, dtype=torch.float32)
+                        goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
                         goal_pos=goal_pos.unsqueeze(0)
                         _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
                         s1Values[i_buf]=s1Values[i_buf][0]
@@ -658,11 +669,20 @@ if not os.path.exists(gifs_path):
     
 
 if __name__ == '__main__':
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['CUDA_VISIBLE_DEVICES'] = ""
+    
+    # Check if CUDA is available
+    if torch.cuda.is_available():
+         print("CUDA is available!")
+         
+    else:
+        print("CUDA is not available.")
 
-    shared_model=ACNet(GLOBAL_NET_SCOPE,a_size,None,False,GRID_SIZE,GLOBAL_NET_SCOPE) # Generate global network
-    shared_model.share_memory()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    master_network=ACNet(GLOBAL_NET_SCOPE,a_size,None,False,GRID_SIZE,GLOBAL_NET_SCOPE) # Generate global network
+
+    master_network=master_network.to(device) #moved the model to gpu
+
 
     
     
@@ -675,7 +695,7 @@ if __name__ == '__main__':
     else:
         lr = torch.full((1,), LR_Q)
 
-    trainer = torch.optim.NAdam(shared_model.parameters(), lr=lr)
+    trainer = torch.optim.NAdam(master_network.parameters(), lr=lr)
     # trainer.share_memory()
 
     if TRAINING:
@@ -719,7 +739,7 @@ if __name__ == '__main__':
                 print("Starting worker " + str(worker.workerID))
                 t = threading.Thread(target=(worker_work))
                 t.start()
-                worker_threads.append(t)
+                # worker_threads.append(t)
         # t.join(worker_threads)
 
 if not TRAINING:

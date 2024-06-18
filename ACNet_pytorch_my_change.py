@@ -10,6 +10,7 @@ KEEP_PROB1 = 1  # was 0.5
 KEEP_PROB2 = 1  # was 0.7
 RNN_SIZE = 512
 GOAL_REPR_SIZE = 12
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # batch_size=32
 
 # Used to initialize weights for policy and value output layers
@@ -24,7 +25,8 @@ class ACNet(nn.Module):
     def __init__(self, scope, a_size, trainer, TRAINING, GRID_SIZE, GLOBAL_NET_SCOPE):
         super(ACNet, self).__init__()
         self.scope = scope
-        self.a_size=a_size
+        self.a_size = a_size
+        self.num_layers = 1
         
         # input should be integrated here.. Farhan
         
@@ -47,6 +49,7 @@ class ACNet(nn.Module):
         
         # LSTM layers
         self.lstmcell=nn.LSTMCell(RNN_SIZE,RNN_SIZE)
+        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE,num_layers=self.num_layers,batch_first=True).to(device) #should moved to init_
         
         
         # Output layers
@@ -68,7 +71,6 @@ class ACNet(nn.Module):
     
     def forward(self, inputs, goal_pos, training=True):
         
-
         # inputs=torch.tensor(inputs, dtype=torch.float32,requires_grad=True)
         # goal_pos=torch.tensor(goal_pos, dtype=torch.float32,requires_grad=True)
         # random_tensor = torch.rand(4, 4, 10, 10)
@@ -83,7 +85,7 @@ class ACNet(nn.Module):
         # inputs=random_tensor
         # goal_pos=result_tensor
 
-        
+        batch_size = inputs.shape[0]
         x = F.relu(self.conv1(inputs))
         x = F.relu(self.conv1a(x))
         x = F.relu(self.conv1b(x))
@@ -125,20 +127,24 @@ class ACNet(nn.Module):
         
         
 
-        c_init = torch.zeros(rnn_in.shape[0],RNN_SIZE) # should remove from here
-        h_init = torch.zeros(rnn_in.shape[0],RNN_SIZE)
+        c_init = torch.zeros(self.num_layers,RNN_SIZE).to(device) # should remove from here
+        h_init = torch.zeros(self.num_layers,RNN_SIZE).to(device)
 
         state_init = (c_init, h_init)
 
-        for i in range(rnn_in.size()[0]):
-            hx,cx=self.lstmcell(rnn_in,state_init)
+        # for i in range(rnn_in.size()[0]):
+            
+        #     hx,cx=self.lstmcell(rnn_in,state_init)
 
-        state_in=(hx,cx)
+        # state_in=(hx,cx)
+
+        state_in=state_init 
         
-
-        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE,rnn_in.shape[0],batch_first=True)
+        
+        
        
         lstm_outputs, state_out = self.lstm(rnn_in, state_in) #its dynamic rnn may have to use loops for sequence length
+    
             
         
         policy = F.softmax(self.policy_layer(lstm_outputs)) #there is softmax2d and softmaxlog
