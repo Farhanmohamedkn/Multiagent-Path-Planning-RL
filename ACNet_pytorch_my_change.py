@@ -114,14 +114,17 @@ class ACNet(nn.Module):
         hidden_input = torch.cat((x, goal_layer),dim=1)
         # hid_trans = hidden_input.permute(1,0)
         h1 = self.fc1(hidden_input)
-        if training:
-            d1 = self.dropout1(h1)
+        
+        d1 = self.dropout1(h1)
         h2 = self.fc2(d1)
-        if training:
-            d2 = self.dropout2(h2)
+        
+        d2 = self.dropout2(h2)
         self.h3 = F.relu(d2 + hidden_input)
 
         rnn_in=self.h3
+        if not training:
+            rnn_in=rnn_in
+
 
 
 
@@ -141,6 +144,8 @@ class ACNet(nn.Module):
 
         self.state_in=state_in 
         
+
+        
         
         
        
@@ -153,7 +158,9 @@ class ACNet(nn.Module):
         value = self.value_layer(lstm_outputs)
         blocking = torch.sigmoid(self.blocking_layer(lstm_outputs))
         on_goal = torch.sigmoid(self.on_goal_layer(lstm_outputs))
-        
+
+        if not training:
+                blocking=rnn_in
 
         return policy, value, state_out ,state_in, blocking, on_goal,policy_sig,entropy
 
