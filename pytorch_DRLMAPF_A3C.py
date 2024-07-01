@@ -21,9 +21,17 @@ import imageio
 from ACNet_pytorch_my_change import ACNet
 import torch
 import torch.optim as optim
+import wandb
 import torch.nn as nn
+import torch.multiprocessing as mp
+from multiprocessing import Value
 from torch.utils.tensorboard import SummaryWriter
 
+
+
+wandb.login()
+
+wandb.init(project='memory error ')
 
 RNN_SIZE = 512
 
@@ -33,13 +41,26 @@ def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=
     print("wrote gif")
 
 
+# Lock for synchronizing gradient updates
+gradient_lock = threading.Lock() #should use it to avaoid race condition to update gradients
+
 
 def ensure_shared_grads(model, shared_model):
-    for param, shared_param in zip(model.parameters(),
-                                   shared_model.parameters()):
-        if shared_param.grad is not None:
-            return
-        shared_param._grad = param.grad
+    with gradient_lock:
+            for param, shared_param in zip(model.parameters(),shared_model.parameters()):
+
+                if  param.grad is not None:
+                    if shared_param.grad is None:
+                        # print(param.grad.is_cuda)
+                        shared_param.grad = param.grad.clone()
+                    # print(shared_param.grad.is_cuda)
+                    # print(param.grad.is_cuda)
+                    shared_param.grad = param.grad
+                    # print("grad param updated")
+                # else:
+                        # Optionally, you can log or handle the case where param.grad is None
+                        # print(f"Warning: Gradients for parameter are None")
+            torch.nn.utils.clip_grad_norm_(shared_model.parameters(),max_norm=1.0)
 
 
 def discount(x, gamma):
@@ -52,7 +73,7 @@ def good_discount(x, gamma):
 
 #worker agent
 class Worker:
-    def __init__(self, game, metaAgentID, workerID, a_size, groupLock):
+    def __init__(self,master_network, game, metaAgentID, workerID, a_size, groupLock):
         self.workerID = workerID
         self.env = game
         self.metaAgentID = metaAgentID
@@ -64,9 +85,12 @@ class Worker:
         #Create the local copy of the network and the tensorflow op to copy global parameters to local network
         self.local_AC = ACNet(self.name,a_size,trainer,True,GRID_SIZE,GLOBAL_NET_SCOPE).to(device) #this should be our model?
 
-        print("Model's state_dict:")
-        for param_tensor in self.local_AC .state_dict():
-            print(param_tensor, "\t", self.local_AC .state_dict()[param_tensor].size())
+        # print("Model's state_dict:")
+        # for param_tensor in self.local_AC .state_dict():
+        #     print(param_tensor, "\t", self.local_AC .state_dict()[param_tensor].size())
+
+        # sync the weights at the beginning
+        self.local_AC.load_state_dict(master_network.state_dict())
         # self.pull_global = update_target_graph(GLOBAL_NET_SCOPE, self.name)
         
 
@@ -81,165 +105,238 @@ class Worker:
     def train(self, rollout, gamma, bootstrap_value, rnn_state0, imitation=False):
         global episode_count
         
-        optimizer = torch.optim.NAdam(self.local_AC.parameters(), lr=lr)
-        if imitation:
-                #we calculate the loss differently for imitation
-                #if imitation=True the rollout is assumed to have different dimensions:
-                #[o[0],o[1],optimal_actions]
-                print("imitation mode")
-                inputs_rollout = []
-                goal_pos_rollout = []
-                optimal_actions_rollout = []
-                for item in rollout:
-                    
-                    inputs=torch.tensor(np.array(item[0]), dtype=torch.float32)
-                    
-                    goal_pos=torch.tensor(np.array(item[1]), dtype=torch.float32)
-                    
-                    
-                    optimal_actions=torch.tensor(item[2])
+        if ADAPT_LR:
+        #computes LR_Q/sqrt(ADAPT_COEFF*steps+1)
+        #we need the +1 so that lr at step 0 is defined
+            lr = torch.div(LR_Q, torch.sqrt(torch.add(1., torch.mul(ADAPT_COEFF, episode_count))))
+        else:
+            lr=LR_Q
+        wandb.log({"current_learning_rate ": lr})
+        
+        #look into foreach=False may because of detach() it should be true(default) for better performance
+        optimizer = torch.optim.Adam(master_network.parameters(), lr=lr)
+        if len(rollout)>0: #sometimes the rollout is empty array check why
 
-                    inputs_rollout.append(inputs)
-                    goal_pos_rollout.append(goal_pos)
-                    optimal_actions_rollout.append(optimal_actions)
+                if imitation:
+                        
+                        
                     
-                
-                
-                global_step=episode_count
-                
-                inputs = torch.stack(inputs_rollout).to(device)
-                goal_pos=torch.stack(goal_pos_rollout).to(device)
+                        #we calculate the loss differently for imitation
+                        #if imitation=True the rollout is assumed to have different dimensions:
+                        #[o[0],o[1],optimal_actions]
+                        print("imitation mode")
+                        inputs_rollout = []
+                        goal_pos_rollout = []
+                        optimal_actions_rollout = []
+                        for item in rollout:
+                            
+                            inputs=item[0] #dtype=torch.float32
+                            
+                            goal_pos=item[1] #dtype=torch.float32)
+                            
+                            
+                            optimal_actions=item[2]
 
-                print("inputs.shape",inputs.shape)
-                print("goal_pos.shape",goal_pos.shape)
+                            inputs_rollout.append(inputs)
+                            goal_pos_rollout.append(goal_pos)
+                            optimal_actions_rollout.append(optimal_actions)
+                            
+                        
+                        
+                        global_step=episode_count
+                        inputs=np.array(inputs_rollout)
+                        inputs=torch.tensor(inputs, dtype=torch.float32).to(device)
+                        goal_pos=np.array(goal_pos_rollout)
+                        goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
 
-                self.local_AC.train()
-                output=self.local_AC.forward(inputs,goal_pos,training=True)
+                    
+
+                        self.local_AC.train()
+                        output=self.local_AC(inputs,goal_pos,state_in=rnn_state0,training=True)
+                    
+                        self.policy, self.value, self.state_out ,self.state_in, self.blocking, self.on_goal,self.policy_sig,self.entropy=output
+                        self.optimal_actions  = torch.tensor(optimal_actions_rollout).to(device)
+                        self.optimal_actions_onehot = torch.nn.functional.one_hot(self.optimal_actions, num_classes=a_size)
+                        self.optimal_actions_onehot =torch.argmax(self.optimal_actions_onehot, dim=1)
+                        self.optimal_actions_onehot=self.optimal_actions_onehot.long()
+
+                        loss_function=nn.CrossEntropyLoss()
+                        self.imitation_loss = loss_function(self.entropy,self.optimal_actions_onehot)
+                        #cant do this directly because of the softmaxissue
+                        # self.imitation_loss = torch.sum(self.optimal_actions_onehot*self.policy)
+
+                        
+                        
+                        # Backward pass and optimization
+                        optimizer.zero_grad()
+                        self.imitation_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.local_AC.parameters(),max_norm=0.1)
+                        # Manually push the gradients to the global network
+                        ensure_shared_grads(self.local_AC,master_network) 
+                        optimizer.step()
+                        self.local_AC.load_state_dict(master_network.state_dict())
+
+                        return self.imitation_loss
+                        
+                # print("Shape of rollout:_start", rollout.shape, rollout.size)
                
-                self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
-                self.optimal_actions  = torch.tensor(optimal_actions_rollout)
-                self.optimal_actions_onehot = torch.nn.functional.one_hot(self.optimal_actions, num_classes=a_size)
-                # self.imitation_loss = torch.mean(nn.CrossEntropyLoss(self.optimal_actions_onehot,self.policy)) 
+                observations_rollout = []
+                goals_rollout = []
+                actions_rollout = []
+                rewards_rollout = []
+                values_rollout = []
+                valids_rollout = []
+                blockings_rollout = []
+                on_goals_rollout = []
+                train_value_rollout = []
                 
+                for item in rollout:
+                    observations=item[0]
+                    goals=item[-2]
+                    actions=item[1]
+                    rewards=item[2]
+                    values = item[5]
+                    valids = item[6]
+                    blockings = torch.tensor(item[10])
+                    on_goals = torch.tensor(item[8])
+                    train_value=torch.tensor(item[-1])
+
+                    observations_rollout.append(observations)
+                    goals_rollout.append(goals)
+                    actions_rollout.append(actions)
+                    rewards_rollout.append(rewards)
+                    values_rollout.append(values)
+                    valids_rollout.append(valids)
+                    blockings_rollout.append(blockings)
+                    on_goals_rollout.append(on_goals)
+                    train_value_rollout.append(train_value)
+                    
+                global_step=episode_count
+
+                # Here we take the rewards and values from the rollout, and use them to 
+                # generate the advantage and discounted returns. (With bootstrapping)
+                # The advantage function uses "Generalized Advantage Estimation"
+                observations1=np.array(observations_rollout,dtype=float)
+                goals1=np.array(goals_rollout,dtype=float)
+                # observations=torch.tensor(observations,dtype=torch.float32).to(device)
+                # goals=torch.tensor(goals,dtype=torch.float32).to(device)
+
+                rewards1=np.array(rewards_rollout,dtype=object)
+                if torch.is_tensor(bootstrap_value):
+                    bootstrap_value = bootstrap_value.cpu().detach().numpy()
+                    bootstrap_value = bootstrap_value.item()
                 
-                # Backward pass and optimization
+                self.rewards_plus = np.asarray(rewards1.tolist() + [bootstrap_value])
+                if isinstance(self.rewards_plus, np.ndarray) and any(x is None for x in self.rewards_plus):
+                    print("array1 contains None")
+                discounted_rewards = discount(self.rewards_plus,gamma)[:-1]
+                # discounted_rewards= torch.stack([torch.tensor(item[-2]) for item in rollout])
+                value_temp=[tensor.cpu().detach().numpy() for tensor in values_rollout]
+                values1=np.array(value_temp,dtype=object)
+                self.value_plus = np.asarray(values1.tolist() + [bootstrap_value])
+                # values_tensor = torch.tensor(values.tolist(), dtype=torch.float32)
+                # self.value_plus = values_tensor + bootstrap_value_tensor
+                advantages = rewards1 + gamma * self.value_plus[1:] - self.value_plus[:-1]
+                advantages1 = good_discount(advantages,gamma)
+
+
+                num_samples = min(EPISODE_SAMPLES,len(advantages1))
+                sampleInd = np.sort(np.random.choice(advantages1.shape[0], size=(num_samples,), replace=False))
+                advantages2=np.array(advantages1, dtype=np.float32)
+
+                
+                # observations = torch.stack(observations).to(device)
+                # goals=torch.stack(goals_rollout).to(device)
+                self.local_AC.train()
+                inputs1=torch.tensor(observations1,dtype=torch.float32).to(device)
+                goal_pos1=torch.tensor(goals1,dtype=torch.float32).to(device)
+
+                # Monitor initial memory usage
+                # print(f"Initial allocated memory: {torch.cuda.memory_allocated()} bytes")
+                # print(f"Initial reserved memory: {torch.cuda.memory_reserved()} bytes")
+
+
+                output=self.local_AC(inputs1,goal_pos1,state_in=rnn_state0,training=True)
+
+
+                # Monitor memory usage after forward pass
+                # print(f"After forward pass allocated memory: {torch.cuda.memory_allocated()} bytes")
+                # print(f"After forward pass reserved memory: {torch.cuda.memory_reserved()} bytes")
+
+                self.policy, self.value, self.state_out ,self.state_in, self.blocking, self.on_goal,self.policy_sig,self.entropy=output
+                
+
+
+                self.target_v   = torch.from_numpy(discounted_rewards.copy()).to(device)  #torch.tensor(discounted_rewards)
+                self.actions  = torch.tensor(actions_rollout).to(device)
+
+                self.actions_onehot = torch.nn.functional.one_hot(self.actions, num_classes=a_size)
+                self.train_valid = torch.stack(valids_rollout).to(device)
+                self.advantages= torch.from_numpy(advantages2.copy()).to(device) #torch.tensor(advantages)
+                self.train_value=torch.stack(train_value_rollout).to(device)
+                self.target_blockings=torch.stack(blockings_rollout).to(device)
+                self.target_on_goals =torch.stack(on_goals_rollout).to(device)
+                self.responsible_outputs    = torch.sum(self.policy * self.actions_onehot,dim=1)
+                length_roll=len(observations_rollout) #length of the rollouts
+                
+
+                #calculate loss
+                self.value_loss    = torch.sum(self.train_value * torch.square((self.target_v-self.value.view(-1))))
+                self.entropy       = - torch.sum(self.policy*(torch.log((torch.clamp(self.policy, min=1e-10, max=1.0)))))
+                self.policy_loss   = torch.sum(self.advantages*(torch.log((torch.clamp(self.responsible_outputs, min=1e-15, max=1.0)))))
+                self.valid_loss    = - torch.sum(((torch.log((torch.clamp(self.policy_sig, min=1e-10, max=1.0))))*self.train_valid)+((torch.log(torch.clamp(1-self.policy_sig, min=1e-10, max=1.0)))*(1-self.train_valid)))
+                self.blocking_loss = - torch.sum(((torch.log((torch.clamp(self.blocking, min=1e-15, max=1.0))))*self.target_blockings)+((torch.log((torch.clamp(1-self.blocking, min=1e-15, max=1.0))))*(1-self.target_blockings)))
+                self.on_goal_loss  = - torch.sum(((torch.log((torch.clamp(self.on_goal, min=1e-10, max=1.0))))*self.target_on_goals)+((torch.log((torch.clamp(1-self.on_goal, min=1e-10, max=1.0))))*(1-self.target_on_goals)))
+                self.loss          = (0.5 * self.value_loss + self.policy_loss + 0.5*self.valid_loss - self.entropy * 0.01 +.5*self.blocking_loss+0.5*self.on_goal_loss).to(device)
+                
+                #calculated loss and apply gradient
+
                 optimizer.zero_grad()
-                # self.imitation_loss.backward()
+                # print(torch.cuda.max_memory_allocated())
+                # print(torch.cuda.memory_allocated())
+                # print(torch.cuda.memory_summary())
+
+                self.loss.backward()
+                # Print parameters that have None gradients
+                for name, param in self.local_AC.named_parameters():
+                    if param.grad is None:
+                        print(f"Parameter with None gradient: {name}")
+
+                #  check for gradients
+                # for param in self.local_AC.parameters():
+                    # if param.grad is not None:
+                        # print(f"Param: {param.shape}, Grad type: {type(param.grad)}, Grad shape: {param.grad.shape}")
+
+
+
+                # Monitor memory usage after backward pass
+                # print(f"After backward pass allocated memory: {torch.cuda.memory_allocated()} bytes")
+                # print(f"After backward pass reserved memory: {torch.cuda.memory_reserved()} bytes")
+
+
+                torch.nn.utils.clip_grad_norm_(self.local_AC.parameters(),max_norm=1.0)
+                # Manually push the gradients to the global network
+                # print(self.agentID)
+                ensure_shared_grads(self.local_AC,master_network)  
+                
+                    
                 optimizer.step()
-                return self.imitation_loss
-           
-        # print("Shape of rollout:_start", rollout.shape, rollout.size)
-        observations_rollout = []
-        goals_rollout = []
-        actions_rollout = []
-        rewards_rollout = []
-        values_rollout = []
-        valids_rollout = []
-        blockings_rollout = []
-        on_goals_rollout = []
-        train_value_rollout = []
+                 #sync the weights again
+                self.local_AC.load_state_dict(master_network.state_dict())
+                g_n=1
+                v_n=1
+                
 
-        for item in rollout:
-            observations=torch.tensor(item[0], dtype=torch.float32)
-            goals=torch.tensor(item[-2], dtype=torch.float32)
-            actions=item[1]
-            rewards=item[2]
-            values = torch.tensor(item[5])
-            valids = torch.tensor(item[6])
-            blockings = torch.tensor(item[10])
-            on_goals = torch.tensor(item[8])
-            train_value=torch.tensor(item[-1])
+                # Update the global network using gradients from loss
+                # Generate network statistics to periodically save
 
-            observations_rollout.append(observations)
-            goals_rollout.append(goals)
-            actions_rollout.append(actions)
-            rewards_rollout.append(rewards)
-            values_rollout.append(values)
-            valids_rollout.append(valids)
-            blockings_rollout.append(blockings)
-            on_goals_rollout.append(on_goals)
-            train_value_rollout.append(train_value)
-            
-        global_step=episode_count
+                
+                return self.value_loss/length_roll, self.policy_loss /length_roll, self.valid_loss/length_roll, self.entropy/length_roll, self.blocking_loss/length_roll, self.on_goal_loss/length_roll, g_n, v_n
+                
 
-        # Here we take the rewards and values from the rollout, and use them to 
-        # generate the advantage and discounted returns. (With bootstrapping)
-        # The advantage function uses "Generalized Advantage Estimation"
-        
-        rewards=np.array(rewards_rollout,dtype=object)
-        if torch.is_tensor(bootstrap_value):
-            bootstrap_value = bootstrap_value.detach().numpy()
-            bootstrap_value = bootstrap_value.item()
-        
-        self.rewards_plus = np.asarray(rewards.tolist() + [bootstrap_value])
-        discounted_rewards = discount(self.rewards_plus,gamma)[:-1]
-        # discounted_rewards= torch.stack([torch.tensor(item[-2]) for item in rollout])
-        values=np.array(values_rollout,dtype=object)
-        self.value_plus = np.asarray(values.tolist() + [bootstrap_value])
-        # values_tensor = torch.tensor(values.tolist(), dtype=torch.float32)
-        # self.value_plus = values_tensor + bootstrap_value_tensor
-        advantages = rewards + gamma * self.value_plus[1:] - self.value_plus[:-1]
-        advantages = good_discount(advantages,gamma)
-
-
-        num_samples = min(EPISODE_SAMPLES,len(advantages))
-        sampleInd = np.sort(np.random.choice(advantages.shape[0], size=(num_samples,), replace=False))
-        advantages=np.array(advantages, dtype=np.float32)
-
-        
-        observations = torch.stack(observations_rollout).to(device)
-        goals=torch.stack(goals_rollout).to(device)
-        self.local_AC.train()
-        output=self.local_AC.forward(observations,goals,training=True)
-        self.policy, self.value, self.state_out ,self.state_in, self.state_init, self.blocking, self.on_goal,self.policy_sig=output
-        
-
-
-        self.target_v   = torch.from_numpy(discounted_rewards.copy())  #torch.tensor(discounted_rewards)
-        self.actions  = torch.tensor(actions_rollout)
-        self.actions_onehot = torch.nn.functional.one_hot(self.actions, num_classes=a_size)
-        self.train_valid = torch.stack(valids_rollout)
-        self.advantages= torch.from_numpy(advantages.copy()) #torch.tensor(advantages)
-        self.train_value=torch.stack(train_value_rollout)
-        self.target_blockings=torch.stack(blockings_rollout)
-        self.target_on_goals =torch.stack(on_goals_rollout)
-        self.responsible_outputs    = torch.sum(self.policy * self.actions_onehot)
-        length_roll=len(observations_rollout) #length of the rollouts
-        
-
-        #calculate loss
-        self.value_loss    =   torch.sum(self.train_value * torch.square((self.target_v-self.value.view(-1))))
-        self.entropy       = - torch.sum(self.policy*(torch.log((torch.clamp(self.policy, min=1e-10, max=1.0)))))
-        self.policy_loss   = - torch.sum((torch.log((torch.clamp(self.responsible_outputs, min=1e-15, max=1.0))))*self.advantages)
-        self.valid_loss    = - torch.sum(((torch.log((torch.clamp(self.policy_sig, min=1e-10, max=1.0))))*self.train_valid)+((torch.log(torch.clamp(1-self.policy_sig, min=1e-10, max=1.0)))*(1-self.train_valid)))
-        self.blocking_loss = - torch.sum(((torch.log((torch.clamp(self.blocking, min=1e-15, max=1.0))))*self.target_blockings)+((torch.log((torch.clamp(1-self.blocking, min=1e-15, max=1.0))))*(1-self.target_blockings)))
-        self.on_goal_loss  = - torch.sum(((torch.log((torch.clamp(self.on_goal, min=1e-10, max=1.0))))*self.target_on_goals)+((torch.log((torch.clamp(1-self.on_goal, min=1e-10, max=1.0))))*(1-self.target_on_goals)))
-        self.loss          = 0.5 * self.value_loss + self.policy_loss + 0.5*self.valid_loss - self.entropy * 0.01 +.5*self.blocking_loss
-        
-        #calculated loss and apply gradient
-
-        optimizer.zero_grad()
-
-
-        self.loss.backward()
-            
-           
-            
-        optimizer.step()
-        g_n=1
-        v_n=1
-        
-
-        # Update the global network using gradients from loss
-        # Generate network statistics to periodically save
-
-        
-        return self.value_loss/length_roll, self.policy_loss /length_roll, self.valid_loss/length_roll, self.entropy/length_roll, self.blocking_loss/length_roll, self.on_goal_loss/length_roll, g_n, v_n
-        
-
-    def shouldRun(self, coord, episode_count):
+    def shouldRun(self, stop_event, episode_count):
         if TRAINING:
-            return (not coord.should_stop())
+            return not stop_event.is_set()
         else:
             return (episode_count < NUM_EXPS)
 
@@ -277,14 +374,19 @@ class Worker:
                 result[i].append([o[0],o[1],a])
         return result
         
-    def work(self,max_episode_length,gamma):
+    def work(self,max_episode_length,gamma,stop_event):
         global episode_count, swarm_reward, episode_rewards, episode_lengths, episode_mean_values, episode_invalid_ops,episode_wrong_blocking #, episode_invalid_goals
         total_steps, i_buf = 0, 0
         episode_buffers, s1Values = [ [] for _ in range(NUM_BUFFERS) ], [ [] for _ in range(NUM_BUFFERS) ]
         
     
-        while (episode_count<=max_episode_length): #should implement the cordinator of thread
-
+        while episode_count<60000:
+            torch.autograd.set_detect_anomaly(True)
+             #should implement the cordinator of thread
+            
+            # sync the weights at the beginning
+            self.local_AC.load_state_dict(master_network.state_dict())
+            
             episode_buffer, episode_values = [], []
             episode_reward = episode_step_count = episode_inv_count = 0
             d = False
@@ -297,6 +399,7 @@ class Worker:
             s                     = self.env._observe(self.agentID)
             blocking              = False
             p=self.env.world.getPos(self.agentID)
+            
             on_goal               = self.env.world.goals[p[0],p[1]]==self.agentID
             s                     = self.env._observe(self.agentID)
             # c_in = torch.zeros(1, RNN_SIZE)
@@ -311,9 +414,13 @@ class Worker:
             goal_pos=np.array(goal_pos)
             goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
             goal_pos=goal_pos.unsqueeze(0).to(device)
+            c_init = torch.zeros(RNN_SIZE).unsqueeze(0).to(device) # should remove from here
+            h_init = torch.zeros(RNN_SIZE).unsqueeze(0).to(device)
+
+            state_init = (c_init, h_init)
             
-            _, _, _,_,state_init,_,_,_=self.local_AC(inputs=inputs,goal_pos=goal_pos,training=True)
-            print("hello")
+            # _, _, _,_,state_init,_,_,_,_=self.local_AC(inputs=inputs,goal_pos=goal_pos,state_in=state_init,training=True)
+            
             rnn_state0            = state_init
             RewardNb = 0 
             wrong_blocking  = 0
@@ -326,12 +433,13 @@ class Worker:
 
             # reset swarm_reward (for tensorboard)
             swarm_reward[self.metaAgentID] = 0
-            if episode_count<PRIMING_LENGTH  or demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
+            if episode_count<PRIMING_LENGTH or demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
                 #for the first PRIMING_LENGTH episodes, or with a certain probability
                 #don't train on the episode and instead observe a demonstration from M*
-                if self.workerID==1 and episode_count%100==0:
+                if self.workerID==1 and episode_count%1000==0:
                     # Save the model state dictionary
-                    torch.save(self.local_AC.state_dict(), f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
+                    torch.save({'model_state_dict': master_network.state_dict()}, f"{model_path}/model-{episode_count}.pt") 
+                    torch.save({'model_state_dict': self.local_AC.state_dict()}, f"{model_path}/model-{episode_count+1}.pt")# local or global? should be global right?
 
                     print(f"Model saved at {model_path}/model-{episode_count}.pt")
                     # saver.save(sess, model_path+'/model-'+str(int(episode_count))+'.cptk')
@@ -343,7 +451,9 @@ class Worker:
                     start_positions=tuple(self.env.getPositions())
                     goals=tuple(self.env.getGoals())
                     try:
+                        print("before")
                         mstar_path=cpp_mstar.find_path(world,start_positions,goals,2,5)
+                        print("after")
                         rollouts[self.metaAgentID]=self.parse_path(mstar_path)
                     except OutOfTimeError:
                         #M* timed out 
@@ -356,15 +466,13 @@ class Worker:
 
                     episode_count+=1./num_workers
                     if self.agentID==1:
-                        print("imitation loss wrote to the summary")
+                        # print("imitation loss wrote to the summary")
                         # Log the imitation loss with the tag 'Losses/Imitation loss'
-                        writer.add_scalar('Losses/Imitation_loss', i_l, episode_count)
-                        writer.flush()
+                        wandb.log({"Losses/Imitation_loss ": i_l})
+                        # writer.add_scalar('Losses/Imitation_loss', i_l, episode_count)
+                        # writer.flush()
                         # writer.close()
-                        # summary = tf.compat.v1.Summary()
-                        # summary.value.add(tag='Losses/Imitation loss', simple_value=i_l)
-                        # global_summary.add_summary(summary, int(episode_count))
-                        # global_summary.flush()
+                        
                     continue
                 continue
             saveGIF = False
@@ -387,15 +495,12 @@ class Worker:
                 goal_pos=goal_pos.unsqueeze(0)
                 
 
-                self.local_AC.eval()
-                with torch.no_grad():
-                    a_dist, v, rnn_state,state_in,state_init,pred_blocking,pred_on_goal,policy_sig=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
-
-                a_dist=a_dist.detach()
-                v=v.detach()
-                pred_blocking=pred_blocking.detach()
-                pred_on_goal=pred_on_goal.detach()
-                policy_sig=policy_sig.detach()
+                # self.local_AC.eval()
+                # with torch.no_grad():
+                
+                a_dist, v, rnn_state,state_in,pred_blocking,pred_on_goal,policy_sig,entropy=self.local_AC(inputs=inputs,goal_pos=goal_pos,state_in=state_init,training=True)
+                #there is an other way using no_grad() instead of detach
+                
 
 
                  # Check if the argmax of a_dist is in validActions
@@ -428,6 +533,10 @@ class Worker:
 
                 _, r, _, _, on_goal,blocking,_ = self.env._step((self.agentID, a),episode=episode_count)
 
+
+
+                
+
                 self.synchronize() # synchronize threads
 
                 # Get common observation for all agents after all individual actions have been performed
@@ -448,6 +557,8 @@ class Worker:
                 if r>0:
                     RewardNb += 1
                 if d == True:
+                    # agents, agents_past, agent_goals = mapf_gym.State.scanForAgents(self) #to see agent actually moved or not
+                    # print( agents, agents_past, agent_goals)
                     print('\n{} Goodbye World. We did it!'.format(episode_step_count), end='\n')
 
                 # If the episode hasn't ended, but the experience buffer is full, then we
@@ -470,7 +581,7 @@ class Worker:
                         goal_pos=np.array(goal_pos)
                         goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
                         goal_pos=goal_pos.unsqueeze(0)
-                        _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC.forward(inputs=inputs,goal_pos=goal_pos,training=True)
+                        _,s1Values[i_buf],_,_,_,_,_,_=self.local_AC(inputs=inputs,goal_pos=goal_pos,state_in=rnn_state,training=True)
                         s1Values[i_buf]=s1Values[i_buf][0]
 
                         
@@ -479,23 +590,32 @@ class Worker:
                     if (episode_count-EPISODE_START) < NUM_BUFFERS:
                         i_rand = np.random.randint(i_buf+1)
                     else:
+                        
+                        
                         i_rand = np.random.randint(NUM_BUFFERS)
+                
                         #detach each element
                         #put together again
                         # tmp = np.array(episode_buffers[i_rand],dtype=object)
-                        tmp = np.array(episode_buffers[i_rand],dtype=object)
+                        
+                        # tmp = np.array(episode_buffers[i_rand],dtype=object)
 
                         # tmp=torch.sta(episode_buffers[i_rand])
-                        while tmp.shape[0] == 0:
-                            i_rand = np.random.randint(NUM_BUFFERS)
-                            tmp = np.array(episode_buffers[i_rand])
+                        # while tmp.shape[0] == 0:
+                            # i_rand = np.random.randint(NUM_BUFFERS)
+                            # tmp = np.array(episode_buffers[i_rand])
                     v_l,p_l,valid_l,e_l,b_l,og_l,g_n,v_n = self.train(episode_buffers[i_rand],gamma,s1Values[i_rand],rnn_state0)
 
                     i_buf = (i_buf + 1) % NUM_BUFFERS
-                    rnn_state0             = rnn_state
+                    rnn_state0             = (rnn_state[0].clone().detach(),rnn_state[1].clone().detach())
                     episode_buffers[i_buf] = []
 
                 self.synchronize() # synchronize threads
+                
+                # sync the weights at the end also???
+    
+                self.local_AC.load_state_dict(master_network.state_dict())
+
                 # sess.run(self.pull_global)
                 if episode_step_count >= max_episode_length or d:
                     break
@@ -503,7 +623,7 @@ class Worker:
             episode_lengths[self.metaAgentID].append(episode_step_count)
             episode_values=[t.detach() for t in episode_values]
 
-            episode_mean_values[self.metaAgentID].append(np.nanmean(episode_values))
+            # episode_mean_values[self.metaAgentID].append(np.nanmean(episode_values))
             episode_invalid_ops[self.metaAgentID].append(episode_inv_count)
             episode_wrong_blocking[self.metaAgentID].append(wrong_blocking)
 
@@ -530,38 +650,57 @@ class Worker:
             else:
                 # print("Episode count=",episode_count)
                 episode_count+=1./num_workers
-
-                if episode_count % SUMMARY_WINDOW == 0:
-                    if episode_count % 100 == 0:
+                if episode_count % 1000 == 0:
+                        print("here")
                         print ('Saving Model', end='\n')
-                        torch.save(self.local_AC.state_dict(), f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
+                        torch.save({'model_state_dict': master_network.state_dict()}, f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
+                        torch.save({'model_state_dict': self.local_AC.state_dict()}, f"{model_path}/model-{episode_count+1}.pt")
+                        print ('Saved Model', end='\n')
+                        
+                if episode_count % SUMMARY_WINDOW == 0:
+                    if episode_count % 1000 == 0:
+                        print("here")
+                        print ('Saving Model', end='\n')
+                        torch.save({'model_state_dict': master_network.state_dict()}, f"{model_path}/model-{episode_count}.pt") # local or global? should be global right?
+                        torch.save({'model_state_dict': self.local_AC.state_dict()}, f"{model_path}/model-{episode_count+1}.pt")
                         print ('Saved Model', end='\n')
                     SL = SUMMARY_WINDOW * num_workers
                     mean_reward = np.nanmean(episode_rewards[self.metaAgentID][-SL:])
                     mean_length = np.nanmean(episode_lengths[self.metaAgentID][-SL:])
-                    mean_value = np.nanmean(episode_mean_values[self.metaAgentID][-SL:])
+                    # mean_value = np.nanmean(episode_mean_values[self.metaAgentID][-SL:])
                     mean_invalid = np.nanmean(episode_invalid_ops[self.metaAgentID][-SL:])
                     mean_wrong_blocking = np.nanmean(episode_wrong_blocking[self.metaAgentID][-SL:])
                     # current_learning_rate = sess.run(lr,feed_dict={global_step:episode_count}) calculate current learning rate
 
                 
                     # writer.add_scalar('Perf/Learning Rate', current_learning_rate,episode_count)
-                    writer.add_scalar('Perf/Reward', mean_reward,episode_count)
-                    writer.add_scalar('Perf/Length', mean_length,episode_count)
+                    wandb.log({"Perf/Reward": mean_reward, "episode_count": episode_count})
+                    wandb.log({"current_learning_rate ": lr})
+                    wandb.log({"Perf/Length": mean_length})
+                    wandb.log({"Perf/Valid Rate": ((mean_length-mean_invalid)/mean_length)})
+                    wandb.log({"Perf/Blocking Prediction Accuracy": ((mean_length-mean_wrong_blocking)/mean_length)})
+                    wandb.log({"Losses/Value Loss": v_l})
+                    wandb.log({"Losses/Policy Loss": p_l})
+                    wandb.log({"Losses/Blocking Loss": b_l})
+                    wandb.log({"Losses/On Goal Loss": og_l})
+                    wandb.log({"Losses/Valid Loss": valid_l})
 
-                    writer.add_scalar('Perf/Valid Rate',((mean_length-mean_invalid)/mean_length),episode_count)
+                    # writer.add_scalar('Perf/Reward', mean_reward,episode_count)
+                    # writer.add_scalar('Perf/Length', mean_length,episode_count)
 
-                    writer.add_scalar('Perf/Length', ((mean_length-mean_wrong_blocking)/mean_length),episode_count)
+                    # writer.add_scalar('Perf/Valid Rate',((mean_length-mean_invalid)/mean_length),episode_count)
 
-                    writer.add_scalar('Losses/Value Loss', v_l,episode_count)
+                    # writer.add_scalar('Perf/Length', ((mean_length-mean_wrong_blocking)/mean_length),episode_count)
+
+                    # writer.add_scalar('Losses/Value Loss', v_l,episode_count)
                     
-                    writer.add_scalar('Losses/Policy Loss', p_l,episode_count)
-                    writer.add_scalar('Losses/Blocking Loss', b_l,episode_count)
-                    writer.add_scalar('Losses/On Goal Loss', og_l,episode_count)
-                    writer.add_scalar('Losses/Valid Loss', valid_l,episode_count)
-                    writer.add_scalar('Losses/Grad Norm', g_n,episode_count)
-                    writer.add_scalar('Losses/Var Norm', v_n,episode_count)
-                    writer.flush()
+                    # writer.add_scalar('Losses/Policy Loss', p_l,episode_count)
+                    # writer.add_scalar('Losses/Blocking Loss', b_l,episode_count)
+                    # writer.add_scalar('Losses/On Goal Loss', og_l,episode_count)
+                    # writer.add_scalar('Losses/Valid Loss', valid_l,episode_count)
+                    # writer.add_scalar('Losses/Grad Norm', g_n,episode_count)
+                    # writer.add_scalar('Losses/Var Norm', v_n,episode_count)
+                    # writer.flush()
                     
 
                     if printQ:
@@ -589,7 +728,7 @@ episode_count          = 0
 EPISODE_START          = episode_count
 gamma                  = .95 # discount rate for advantage estimation and reward discounting
 #moved network parameters to ACNet.py
-EXPERIENCE_BUFFER_SIZE = 128
+EXPERIENCE_BUFFER_SIZE = 20
 GRID_SIZE              = 10 #the size of the FOV grid to apply to each agent
 ENVIRONMENT_SIZE       = (10,20)#the total size of the environment (length of one side)
 OBSTACLE_DENSITY       = (0,.2) #range of densities
@@ -601,22 +740,22 @@ NUM_THREADS            = 1 #int(multiprocessing.cpu_count() / (2 * NUM_META_AGEN
 
 NUM_BUFFERS            = 1 # NO EXPERIENCE REPLAY int(NUM_THREADS / 2)
 EPISODE_SAMPLES        = EXPERIENCE_BUFFER_SIZE # 64
-LR_Q                   = 8.e-5 / NUM_THREADS # default: 1e-5
+LR_Q                   = 2e-5  #8.e-5 / NUM_THREADS # default: 1e-5
 ADAPT_LR               = True
 ADAPT_COEFF            = 5.e-5 #the coefficient A in LR_Q/sqrt(A*steps+1) for calculating LR
 load_model             = False
 RESET_TRAINER          = False
-model_path             = "pytorch_model"
+model_path             = "/home/noushad/Master_thesis/Primal_Thesis/pytorch_model"
 gifs_path              = 'gifs_primal'
 train_log_path         = '/home/noushad/Master_thesis/Primal_Thesis/train_log_path'
 
-writer = SummaryWriter(log_dir=train_log_path)
+# writer = SummaryWriter(log_dir=train_log_path)
 
 GLOBAL_NET_SCOPE       = 'global'
 
 #Imitation options
 PRIMING_LENGTH         = 0    # number of episodes at the beginning to train only on demonstrations
-DEMONSTRATION_PROB     = 0.5  # probability of training on a demonstration per episode
+DEMONSTRATION_PROB     = 0.2  # probability of training on a demonstration per episode
 
 # Simulation options
 FULL_HELP              = False
@@ -644,7 +783,7 @@ swarm_reward           = [0]*NUM_META_AGENTS
 
 cpu_count=int(multiprocessing.cpu_count())
 print("CPU_Count=",cpu_count)
-print("number of agents=",NUM_META_AGENTS)
+print("number of Meta agents=",NUM_META_AGENTS)
 print("Threads=",NUM_THREADS)
 print("EXPERIENCE_BUFFER_SIZE=",EXPERIENCE_BUFFER_SIZE)
 
@@ -677,13 +816,20 @@ if __name__ == '__main__':
     else:
         print("CUDA is not available.")
 
+    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    master_network=ACNet(GLOBAL_NET_SCOPE,a_size,None,False,GRID_SIZE,GLOBAL_NET_SCOPE) # Generate global network
+    # torch.cuda.memory_snapshot()
+    torch.cuda.empty_cache() #for freeing the cached memory from gpu
+    # print(torch.cuda.max_memory_allocated())
+    # print(torch.cuda.memory_allocated())
+    # print(torch.cuda.memory_summary())
 
-    master_network=master_network.to(device) #moved the model to gpu
 
+    master_network=ACNet(GLOBAL_NET_SCOPE,a_size,None,False,GRID_SIZE,GLOBAL_NET_SCOPE).to(device) # Generate global network
 
+    stop_event = threading.Event()
     
     
     global_step = 0
@@ -721,7 +867,7 @@ if __name__ == '__main__':
         # Create worker classes
         workersTmp = []
         for i in range(ma*num_workers+1,(ma+1)*num_workers+1):
-            workersTmp.append(Worker(gameEnv,ma,n,a_size,groupLock))
+            workersTmp.append(Worker(master_network,gameEnv,ma,n,a_size,groupLock))
             n+=1
         workers.append(workersTmp)
 
@@ -730,23 +876,30 @@ if __name__ == '__main__':
 
         # This is where the asynchronous magic happens.
         # Start the "work" process for each worker in a separate thread.
-        worker_threads = []
+    worker_threads = []
+    # processes = []
         
-        for ma in range(NUM_META_AGENTS):
-            for worker in workers[ma]:
-                groupLocks[ma].acquire(0,worker.name) # synchronize starting time of the threads
-                worker_work = lambda: worker.work(max_episode_length,gamma)
-                print("Starting worker " + str(worker.workerID))
-                t = threading.Thread(target=(worker_work))
-                t.start()
-                # worker_threads.append(t)
-        # t.join(worker_threads)
+    for ma in range(NUM_META_AGENTS):
+        for worker in workers[ma]:
+            # worker_work = lambda: worker.work(max_episode_length,gamma,stop_event)
+            # p = mp.Process(target=worker_work)
+            # print("Starting worker " + str(worker.workerID))
+            # p.start()
+            # processes.append(p)
+            groupLocks[ma].acquire(0,worker.name) # synchronize starting time of the threads
+            worker_work = lambda: worker.work(max_episode_length,gamma,stop_event )
+            print("Starting worker " + str(worker.workerID))
+            t = threading.Thread(target=(worker_work))
+            t.start()
+            worker_threads.append(t)
+    # for p in processes:
+        # p.join()
+    
+    for t in worker_threads:
+        t.join()
 
 if not TRAINING:
     print([np.mean(plan_durations), np.sqrt(np.var(plan_durations)), np.mean(np.asarray(plan_durations < max_episode_length, dtype=float))])
-
-
-# In[ ]:
 
 
 

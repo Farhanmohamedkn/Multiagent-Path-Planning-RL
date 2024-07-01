@@ -48,8 +48,8 @@ class ACNet(nn.Module):
         self.dropout2 = nn.Dropout(p=1-KEEP_PROB2)
         
         # LSTM layers
-        self.lstmcell=nn.LSTMCell(RNN_SIZE,RNN_SIZE)
-        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE,num_layers=self.num_layers,batch_first=True).to(device) #should moved to init_
+        # self.lstmcell=nn.LSTMCell(RNN_SIZE,RNN_SIZE)
+        self.lstm = nn.LSTM(RNN_SIZE, RNN_SIZE,num_layers=self.num_layers,batch_first=True) #should moved to init_
         
         
         # Output layers
@@ -59,6 +59,7 @@ class ACNet(nn.Module):
         self.on_goal_layer = nn.Linear(RNN_SIZE, 1)
 
         # Apply custom weight initialization
+        
         self.apply(self.weights_init) #we need it
     
     
@@ -69,7 +70,7 @@ class ACNet(nn.Module):
                 m.bias.data.fill_(0)
     
     
-    def forward(self, inputs, goal_pos, training=True):
+    def forward(self, inputs, goal_pos,state_in,training=True):
         
         # inputs=torch.tensor(inputs, dtype=torch.float32,requires_grad=True)
         # goal_pos=torch.tensor(goal_pos, dtype=torch.float32,requires_grad=True)
@@ -118,19 +119,19 @@ class ACNet(nn.Module):
         h2 = self.fc2(d1)
         if training:
             d2 = self.dropout2(h2)
-        h3 = F.relu(d2 + hidden_input)
+        self.h3 = F.relu(d2 + hidden_input)
 
-        rnn_in=h3
+        rnn_in=self.h3
 
 
 
         
         
 
-        c_init = torch.zeros(self.num_layers,RNN_SIZE).to(device) # should remove from here
-        h_init = torch.zeros(self.num_layers,RNN_SIZE).to(device)
+        # c_init = torch.zeros(self.num_layers,RNN_SIZE) # should remove from here
+        # h_init = torch.zeros(self.num_layers,RNN_SIZE)
 
-        state_init = (c_init, h_init)
+        # state_init = (c_init, h_init)
 
         # for i in range(rnn_in.size()[0]):
             
@@ -138,7 +139,7 @@ class ACNet(nn.Module):
 
         # state_in=(hx,cx)
 
-        state_in=state_init 
+        self.state_in=state_in 
         
         
         
@@ -146,14 +147,15 @@ class ACNet(nn.Module):
         lstm_outputs, state_out = self.lstm(rnn_in, state_in) #its dynamic rnn may have to use loops for sequence length
     
             
-        
+        entropy=self.policy_layer(lstm_outputs) #for calculating imitation loss
         policy = F.softmax(self.policy_layer(lstm_outputs)) #there is softmax2d and softmaxlog
         policy_sig = torch.sigmoid(self.policy_layer(lstm_outputs))
         value = self.value_layer(lstm_outputs)
         blocking = torch.sigmoid(self.blocking_layer(lstm_outputs))
         on_goal = torch.sigmoid(self.on_goal_layer(lstm_outputs))
         
-        return policy, value, state_out ,state_in, state_init, blocking, on_goal,policy_sig
+
+        return policy, value, state_out ,state_in, blocking, on_goal,policy_sig,entropy
 
 # # Usage example
 # net = ACNet('scope', a_size=5, trainer=optim.Adam, TRAINING=True, GRID_SIZE=10, GLOBAL_NET_SCOPE='global')

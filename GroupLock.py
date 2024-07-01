@@ -50,7 +50,8 @@ class GroupLock:
 
             group (int): number of calling thread's group
             id    (key): key given to identify the thread(given in init)'''
-        self._groupConditions[group][id].release()
+        if self.hasReleased[group][id] ==False :
+            self._groupConditions[group][id].release()
         self.hasReleased[group][id] = True
 
         if all(self.hasReleased[group].values()):
