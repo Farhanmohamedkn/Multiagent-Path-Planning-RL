@@ -523,7 +523,7 @@ class Worker:
                         wrong_blocking += 1
                     if (pred_on_goal.flatten()[0] < 0.5) == on_goal:
                         wrong_on_goal += 1
-                    a           = validActions[torch.multinomial(valid_dist, 1, replacement=True).item()]
+                    a           = a = validActions[torch.multinomial(valid_dist, 1, replacement=True).item()]
                     train_val   = 1.
                 else:
                     a         = torch.argmax(a_dist.flatten())

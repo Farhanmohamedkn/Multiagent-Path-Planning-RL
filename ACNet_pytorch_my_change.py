@@ -22,9 +22,8 @@ def normalized_columns_initializer(std=1.0):
     return _initializer
 
 class ACNet(nn.Module):
-    def __init__(self, scope, a_size, trainer, TRAINING, GRID_SIZE, GLOBAL_NET_SCOPE):
+    def __init__(self,a_size,TRAINING, GRID_SIZE):
         super(ACNet, self).__init__()
-        self.scope = scope
         self.a_size = a_size
         self.num_layers = 1
         

@@ -24,6 +24,7 @@ import torch.optim as optim
 import wandb
 import torch.nn as nn
 import torch.multiprocessing as mp
+from shared_optim import SharedAdam
 from multiprocessing import Value
 from torch.utils.tensorboard import SummaryWriter
 
@@ -46,8 +47,7 @@ gradient_lock = threading.Lock() #should use it to avaoid race condition to upda
 
 
 def ensure_shared_grads(model, shared_model):
-    with gradient_lock:
-            for param, shared_param in zip(model.parameters(),shared_model.parameters()):
+    for param, shared_param in zip(model.parameters(),shared_model.parameters()):
 
                 if  param.grad is not None:
                     if shared_param.grad is None:
@@ -60,7 +60,7 @@ def ensure_shared_grads(model, shared_model):
                 # else:
                         # Optionally, you can log or handle the case where param.grad is None
                         # print(f"Warning: Gradients for parameter are None")
-            torch.nn.utils.clip_grad_norm_(shared_model.parameters(),max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(shared_model.parameters(),max_norm=1000)
 
 
 def discount(x, gamma):
@@ -73,34 +73,37 @@ def good_discount(x, gamma):
 
 #worker agent
 class Worker:
-    def __init__(self,master_network, game, metaAgentID, workerID, a_size, groupLock):
-        self.workerID = workerID
-        self.env = game
-        self.metaAgentID = metaAgentID
-        self.name = "worker_"+str(workerID)
-        self.agentID = ((workerID-1) % num_workers) + 1 
-        self.groupLock = groupLock
+    def __init__(self,master_network,optimizer, a_size):
+        self.optimizer = optimizer
+        # self.env = game
+        
+        # self.workerID =workerID
+        
+      
+        self.metaAgentID = 1
+        
+        # self.agentID =workerID
 
-        self.nextGIF = episode_count # For GIFs output
+        # if self.agentID==1:
+                    # print("agent 1 first")
+                    # print(self.env.world.getPos(self.agentID),self.env.world.getPos(self.agentID+1))
+        # else:
+                    # print("agent2 second")
+                    # print(self.env.world.getPos(self.agentID-1),self.env.world.getPos(self.agentID))
+        
+        # print("new env")
+        
+        
+        # self.metaAgentID = metaAgentID
+        # self.name = "worker_"+str(workerID)
+       
         #Create the local copy of the network and the tensorflow op to copy global parameters to local network
-        self.local_AC = ACNet(a_size,True,GRID_SIZE).to(device) #this should be our model?
-
-        # print("Model's state_dict:")
-        # for param_tensor in self.local_AC .state_dict():
-        #     print(param_tensor, "\t", self.local_AC .state_dict()[param_tensor].size())
+        self.local_AC = ACNet(a_size,True,GRID_SIZE).to(device) 
 
         # sync the weights at the beginning
         self.local_AC.load_state_dict(master_network.state_dict())
         # self.pull_global = update_target_graph(GLOBAL_NET_SCOPE, self.name)
         
-
-    def synchronize(self):
-        #handy thing for keeping track of which to release and acquire
-        if(not hasattr(self,"lock_bool")):
-            self.lock_bool=False
-        self.groupLock.release(int(self.lock_bool),self.name)
-        self.groupLock.acquire(int(not self.lock_bool),self.name)
-        self.lock_bool=not self.lock_bool
         
     def train(self, rollout, gamma, bootstrap_value, rnn_state0, imitation=False):
         global episode_count
@@ -114,7 +117,7 @@ class Worker:
         wandb.log({"current_learning_rate ": lr})
         
         #look into foreach=False may because of detach() it should be true(default) for better performance
-        optimizer = torch.optim.Adam(master_network.parameters(), lr=lr)
+        optimizer = self.optimizer
         if len(rollout)>0: #sometimes the rollout is empty array check why
 
                 if imitation:
@@ -144,9 +147,9 @@ class Worker:
                         
                         
                         global_step=episode_count
-                        inputs=np.array(inputs_rollout)
+                        inputs=np.array(inputs_rollout,dtype=float)
                         inputs=torch.tensor(inputs, dtype=torch.float32).to(device)
-                        goal_pos=np.array(goal_pos_rollout)
+                        goal_pos=np.array(goal_pos_rollout,dtype=float)
                         goal_pos=torch.tensor(goal_pos, dtype=torch.float32).to(device)
 
                     
@@ -292,9 +295,7 @@ class Worker:
                 #calculated loss and apply gradient
 
                 optimizer.zero_grad()
-                # print(torch.cuda.max_memory_allocated())
-                # print(torch.cuda.memory_allocated())
-                # print(torch.cuda.memory_summary())
+                
 
                 self.loss.backward()
                 # Print parameters that have None gradients
@@ -334,11 +335,7 @@ class Worker:
                 return self.value_loss/length_roll, self.policy_loss /length_roll, self.valid_loss/length_roll, self.entropy/length_roll, self.blocking_loss/length_roll, self.on_goal_loss/length_roll, g_n, v_n
                 
 
-    def shouldRun(self, stop_event, episode_count):
-        if TRAINING:
-            return not stop_event.is_set()
-        else:
-            return (episode_count < NUM_EXPS)
+
 
     def parse_path(self,path):
         '''needed function to take the path generated from M* and create the 
@@ -374,13 +371,22 @@ class Worker:
                 result[i].append([o[0],o[1],a])
         return result
         
-    def work(self,max_episode_length,gamma,stop_event):
+    def work(self,workerID,max_episode_length,gamma,lock,barrier):
+        # gameEnv = mapf_gym.MAPFEnv(num_agents=num_agents, DIAGONAL_MOVEMENT=DIAG_MVMT, SIZE=ENVIRONMENT_SIZE, 
+                                    # observation_size=GRID_SIZE,PROB=OBSTACLE_DENSITY, FULL_HELP=FULL_HELP)
+        self.workerID =workerID
+        
+      
+        # self.metaAgentID = 1
+        
+        self.agentID =workerID
+        
         global episode_count, swarm_reward, episode_rewards, episode_lengths, episode_mean_values, episode_invalid_ops,episode_wrong_blocking #, episode_invalid_goals
         total_steps, i_buf = 0, 0
         episode_buffers, s1Values = [ [] for _ in range(NUM_BUFFERS) ], [ [] for _ in range(NUM_BUFFERS) ]
         
     
-        while episode_count<60000:
+        while episode_count<=0:
             torch.autograd.set_detect_anomaly(True)
              #should implement the cordinator of thread
             
@@ -393,15 +399,27 @@ class Worker:
 
             # Initial state from the environment
             if self.agentID==1:
-                self.env._reset(self.agentID)
-            self.synchronize() # synchronize starting time of the threads
-            validActions          = self.env._listNextValidActions(self.agentID)
-            s                     = self.env._observe(self.agentID)
+                # self.env._reset(self.agentID)
+                 
+                print("process 1 started ",episode_count)
+            else:
+                print("process 2 started ",episode_count)
+                
+            # self.synchronize() # synchronize starting time of the threads
+            barrier.wait()
+            validActions          = gameEnv._listNextValidActions(self.agentID)
+            if self.agentID==1:
+                    print("process 1 initilized")
+                    print(gameEnv.world.getPos(self.agentID),gameEnv.world.getPos(self.agentID+1))
+            else:
+                    print("process 2 inititlized")
+                    print(gameEnv.world.getPos(self.agentID-1),gameEnv.world.getPos(self.agentID))
+            s                     = gameEnv._observe(self.agentID)
             blocking              = False
-            p=self.env.world.getPos(self.agentID)
+            p=gameEnv.world.getPos(self.agentID)
             
-            on_goal               = self.env.world.goals[p[0],p[1]]==self.agentID
-            s                     = self.env._observe(self.agentID)
+            on_goal               = gameEnv.world.goals[p[0],p[1]]==self.agentID
+            s                     = gameEnv._observe(self.agentID)
             # c_in = torch.zeros(1, RNN_SIZE)
             # h_in = torch.zeros(1, RNN_SIZE)
             # rnn_state             =(c_in, h_in)
@@ -428,12 +446,13 @@ class Worker:
 
             if self.agentID==1:
                 global demon_probs
-                demon_probs[self.metaAgentID]=np.random.rand()
-            self.synchronize() # synchronize starting time of the threads
+                demon_probs[self.metaAgentID-1]=np.random.rand()
+            barrier.wait()
+            # self.synchronize() # synchronize starting time of the threads
 
             # reset swarm_reward (for tensorboard)
-            swarm_reward[self.metaAgentID] = 0
-            if episode_count<PRIMING_LENGTH and demon_probs[self.metaAgentID]<DEMONSTRATION_PROB:
+            swarm_reward[self.metaAgentID-1] = 0
+            if episode_count>100 and demon_probs[self.metaAgentID-1]<DEMONSTRATION_PROB:
                 #for the first PRIMING_LENGTH episodes, or with a certain probability
                 #don't train on the episode and instead observe a demonstration from M*
                 if self.workerID==1 and episode_count%1000==0:
@@ -445,7 +464,7 @@ class Worker:
                     # saver.save(sess, model_path+'/model-'+str(int(episode_count))+'.cptk')
                     
                 global rollouts
-                rollouts[self.metaAgentID]=None
+                rollouts[self.metaAgentID-1]=None
                 if(self.agentID==1):
                     world=self.env.getObstacleMap()
                     start_positions=tuple(self.env.getPositions())
@@ -454,15 +473,15 @@ class Worker:
                         print("before")
                         mstar_path=cpp_mstar.find_path(world,start_positions,goals,2,5)
                         print("after")
-                        rollouts[self.metaAgentID]=self.parse_path(mstar_path)
+                        rollouts[self.metaAgentID-1]=self.parse_path(mstar_path)
                     except OutOfTimeError:
                         #M* timed out 
                         print("timeout",episode_count)
                     except NoSolutionError:
                         print("nosol????",episode_count,start_positions)
-                self.synchronize()
-                if rollouts[self.metaAgentID] is not None:
-                    i_l=self.train(rollouts[self.metaAgentID][self.agentID-1], gamma, None, rnn_state0, imitation=True)
+                # self.synchronize()
+                if rollouts[self.metaAgentID-1] is not None:
+                    i_l=self.train(rollouts[self.metaAgentID-1][self.agentID-1], gamma, None, rnn_state0, imitation=True)
 
                     episode_count+=1./num_workers
                     if self.agentID==1:
@@ -482,7 +501,7 @@ class Worker:
                 GIF_episode = int(episode_count)
                 episode_frames = [ self.env._render(mode='rgb_array',screen_height=900,screen_width=900) ]
                 
-            while (not self.env.finished): # Give me something!
+            while (not gameEnv.finished): # Give me something!
                 #Take an action using probabilities from policy network output.
                 inputs=s[0] #observation #pos,goal,obs maps
                 inputs=np.array(inputs)
@@ -523,7 +542,7 @@ class Worker:
                         wrong_blocking += 1
                     if (pred_on_goal.flatten()[0] < 0.5) == on_goal:
                         wrong_on_goal += 1
-                    a           = validActions[torch.multinomial(valid_dist, 1, replacement=True).item()]
+                    a           = a = validActions[torch.multinomial(valid_dist, 1, replacement=True).item()]
                     train_val   = 1.
                 else:
                     a         = torch.argmax(a_dist.flatten())
@@ -531,18 +550,32 @@ class Worker:
                         a     = validActions[ np.random.choice(range(valid_dist.shape[1]),p=valid_dist.ravel()) ]
                     train_val = 1.
 
-                _, r, _, _, on_goal,blocking,_ = self.env._step((self.agentID, a),episode=episode_count)
+                if self.agentID==1:
+                    print("process 1 before step")
+                    print(gameEnv.world.getPos(self.agentID),gameEnv.world.getPos(self.agentID+1))
+                else:
+                    print("process 2 before step")
+                    print(gameEnv.world.getPos(self.agentID-1),gameEnv.world.getPos(self.agentID))
+
+                _, r, _, _, on_goal,blocking,_ = gameEnv._step((self.agentID, a),episode=episode_count)
+                if self.agentID==1:
+                    print("process 1 after took step")
+                    print(gameEnv.world.getPos(self.agentID),gameEnv.world.getPos(self.agentID+1))
+                else:
+                    print("process 2 after took step")
+                    print(gameEnv.world.getPos(self.agentID-1),gameEnv.world.getPos(self.agentID))
 
 
 
                 
 
-                self.synchronize() # synchronize threads
+                # self.synchronize() # synchronize threads
+                barrier.wait()
 
                 # Get common observation for all agents after all individual actions have been performed
-                s1           = self.env._observe(self.agentID)
-                validActions = self.env._listNextValidActions(self.agentID, a,episode=episode_count)
-                d            = self.env.finished
+                s1           = gameEnv._observe(self.agentID)
+                validActions = gameEnv._listNextValidActions(self.agentID, a,episode=episode_count)
+                d            = gameEnv.finished
 
                 if saveGIF:
                     episode_frames.append(self.env._render(mode='rgb_array',screen_width=900,screen_height=900))
@@ -610,7 +643,8 @@ class Worker:
                     rnn_state0             = (rnn_state[0].clone().detach(),rnn_state[1].clone().detach())
                     episode_buffers[i_buf] = []
 
-                self.synchronize() # synchronize threads
+                # self.synchronize() # synchronize threads
+                barrier.wait()
                 
                 # sync the weights at the end also???
     
@@ -618,25 +652,39 @@ class Worker:
 
                 # sess.run(self.pull_global)
                 if episode_step_count >= max_episode_length or d:
+                    print("hello")
+                    barrier.wait()
+                    if self.agentID==1:
+                        print("break bcz maximum step took by agent=",self.agentID)
+                        gameEnv._reset(self.agentID)
+                        print(gameEnv.world.getPos(self.agentID),gameEnv.world.getPos(self.agentID+1))
+                    else:
+                        print("break bcz maximum step took by agent=",self.agentID)
+                        gameEnv._reset(self.agentID)
+                        print(gameEnv.world.getPos(self.agentID-1),gameEnv.world.getPos(self.agentID))
+                    print("ENV rested for both agent")
                     break
 
-            episode_lengths[self.metaAgentID].append(episode_step_count)
+            
+            print("maximum step took agent=",self.agentID)
+            episode_lengths[self.metaAgentID-1].append(episode_step_count)
             episode_values=[t.detach() for t in episode_values]
 
             # episode_mean_values[self.metaAgentID].append(np.nanmean(episode_values))
-            episode_invalid_ops[self.metaAgentID].append(episode_inv_count)
-            episode_wrong_blocking[self.metaAgentID].append(wrong_blocking)
+            episode_invalid_ops[self.metaAgentID-1].append(episode_inv_count)
+            episode_wrong_blocking[self.metaAgentID-1].append(wrong_blocking)
 
             # Periodically save gifs of episodes, model parameters, and summary statistics.
             if episode_count % EXPERIENCE_BUFFER_SIZE == 0 and printQ:
                 print('                                                                                   ', end='\r')
                 print('{} Episode terminated ({},{})'.format(episode_count, self.agentID, RewardNb), end='\r')
 
-            swarm_reward[self.metaAgentID] += episode_reward
+            swarm_reward[self.metaAgentID-1] += episode_reward
 
-            self.synchronize() # synchronize threads
+            # self.synchronize() # synchronize threads
+            barrier.wait()
 
-            episode_rewards[self.metaAgentID].append(swarm_reward[self.metaAgentID])
+            episode_rewards[self.metaAgentID-1].append(swarm_reward[self.metaAgentID-1])
 
             if not TRAINING:
                 mutex.acquire()
@@ -649,7 +697,10 @@ class Worker:
                 mutex.release()
             else:
                 # print("Episode count=",episode_count)
-                episode_count+=1./num_workers
+                with lock:
+                    print("episode updated  agent",self.agentID,"episode",episode_count)
+                    episode_count+=1./num_workers
+                print("episode count=",episode_count)
                 if episode_count % 1000 == 0:
                         print("here")
                         print ('Saving Model', end='\n')
@@ -665,11 +716,11 @@ class Worker:
                         torch.save({'model_state_dict': self.local_AC.state_dict()}, f"{model_path}/model-{episode_count+1}.pt")
                         print ('Saved Model', end='\n')
                     SL = SUMMARY_WINDOW * num_workers
-                    mean_reward = np.nanmean(episode_rewards[self.metaAgentID][-SL:])
-                    mean_length = np.nanmean(episode_lengths[self.metaAgentID][-SL:])
+                    mean_reward = np.nanmean(episode_rewards[self.metaAgentID-1][-SL:])
+                    mean_length = np.nanmean(episode_lengths[self.metaAgentID-1][-SL:])
                     # mean_value = np.nanmean(episode_mean_values[self.metaAgentID][-SL:])
-                    mean_invalid = np.nanmean(episode_invalid_ops[self.metaAgentID][-SL:])
-                    mean_wrong_blocking = np.nanmean(episode_wrong_blocking[self.metaAgentID][-SL:])
+                    mean_invalid = np.nanmean(episode_invalid_ops[self.metaAgentID-1][-SL:])
+                    mean_wrong_blocking = np.nanmean(episode_wrong_blocking[self.metaAgentID-1][-SL:])
                     # current_learning_rate = sess.run(lr,feed_dict={global_step:episode_count}) calculate current learning rate
 
                 
@@ -723,12 +774,12 @@ class Worker:
 
 
 # Learning parameters
-max_episode_length     = 256
+max_episode_length     = 4
 episode_count          = 0
 EPISODE_START          = episode_count
 gamma                  = .95 # discount rate for advantage estimation and reward discounting
 #moved network parameters to ACNet.py
-EXPERIENCE_BUFFER_SIZE = 50
+EXPERIENCE_BUFFER_SIZE = 10
 GRID_SIZE              = 10 #the size of the FOV grid to apply to each agent
 ENVIRONMENT_SIZE       = (10,20)#the total size of the environment (length of one side)
 OBSTACLE_DENSITY       = (0,.2) #range of densities
@@ -793,22 +844,13 @@ if not os.path.exists(model_path):
     os.makedirs(model_path)
 
 
-if not TRAINING:
-    plan_durations = np.array([0 for _ in range(NUM_EXPS)])
-    mutex = threading.Lock()
-    gifs_path += '_tests'
-    if SAVE_EPISODE_BUFFER and not os.path.exists('gifs3D'):
-        os.makedirs('gifs3D')
 
-#Create a directory to save episode playback gifs to
-if not os.path.exists(gifs_path):
-    os.makedirs(gifs_path)
 
 #from here
     
 
 
-    
+            
 # Check if CUDA is available
 if torch.cuda.is_available():
     print("CUDA is available!")
@@ -816,91 +858,82 @@ if torch.cuda.is_available():
 else:
     print("CUDA is not available.")
 
-    
+# mp.set_start_method('spawn')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-with device:
-
-    # torch.cuda.memory_snapshot()
-    torch.cuda.empty_cache() #for freeing the cached memory from gpu
-    # print(torch.cuda.max_memory_allocated())
-    # print(torch.cuda.memory_allocated())
-    # print(torch.cuda.memory_summary())
 
 
-    master_network=ACNet(a_size,False,GRID_SIZE).to(device) # Generate global network
 
-    stop_event = threading.Event()
+
+master_network=ACNet(a_size,False,GRID_SIZE).to(device) # Generate global network
+
+master_network.share_memory()
     
     
-    global_step = 0
+global_step = 0
 
-    if ADAPT_LR:
+if ADAPT_LR:
         #computes LR_Q/sqrt(ADAPT_COEFF*steps+1)
         #we need the +1 so that lr at step 0 is defined
         lr = torch.div(LR_Q, torch.sqrt(torch.add(1., torch.mul(ADAPT_COEFF, global_step))))
-    else:
+else:
         lr = torch.full((1,), LR_Q)
 
-    trainer = torch.optim.NAdam(master_network.parameters(), lr=lr)
-    # trainer.share_memory()
+optimizer =  SharedAdam(master_network.parameters(), lr=lr)
+optimizer.share_memory()
+    
+workers=Worker(master_network,optimizer,a_size)
 
-    if TRAINING:
+if TRAINING:
         num_workers = NUM_THREADS # Set workers # = # of available CPU threads
         print("no of workers=",num_workers)
-    else:
-        num_workers = NUM_THREADS
-        NUM_META_AGENTS = 1
     
-    gameEnvs, workers, groupLocks = [], [], []
-    n=1#counter of total number of agents (for naming)
-    for ma in range(NUM_META_AGENTS):
-        num_agents=NUM_THREADS # for 1  meta agent have agents equal to number of threads
-        gameEnv = mapf_gym.MAPFEnv(num_agents=num_agents, DIAGONAL_MOVEMENT=DIAG_MVMT, SIZE=ENVIRONMENT_SIZE, 
-                                   observation_size=GRID_SIZE,PROB=OBSTACLE_DENSITY, FULL_HELP=FULL_HELP)
-        gameEnvs.append(gameEnv)
-
-        # # Create groupLock
-        workerNames = ["worker_"+str(i) for i in range(n,n+num_workers)] # identify each agent realted to which meta agent and grouped with lock
-        groupLock = GroupLock.GroupLock([workerNames,workerNames])       #for synchronization of those agents
-        groupLocks.append(groupLock)
-
-        # # Create worker classes
-        workersTmp = []
-        for i in range(ma*num_workers+1,(ma+1)*num_workers+1):
-            workersTmp.append(Worker(master_network,gameEnv,ma,n,a_size,groupLock))
-            n+=1
-        workers.append(workersTmp)
-
-    # global_summary = tf.compat.v1.summary.FileWriter(train_path) # train_primal for visualization of tensorboard
-    
-
-        # This is where the asynchronous magic happens.
-        # Start the "work" process for each worker in a separate thread.
-    worker_threads = []
-    # processes = []
+def worker_function(workerID, max_episode_length, gamma,lock,barrier):
         
-    for ma in range(NUM_META_AGENTS):
-        for worker in workers[ma]:
-            worker_work = lambda: worker.work(max_episode_length,gamma,stop_event)
-            # p = mp.Process(target=worker_work)
-            # print("Starting worker " + str(worker.workerID))
-            # p.start()
-            # processes.append(p)
-            groupLocks[ma].acquire(0,worker.name) # synchronize starting time of the threads
-            # worker_work = worker.work(max_episode_length,gamma,stop_event )
-            print("Starting worker " + str(worker.workerID))
-            t = threading.Thread(target=(worker_work))
-            t.start()
-            worker_threads.append(t)
-    # for p in processes:
-        # p.join()
+        workers.work(workerID,max_episode_length, gamma,lock,barrier)
     
-    for t in worker_threads:
-        t.join()
+    
+num_agents=NUM_THREADS # for 1  meta agent have agents equal to number of threads
+gameEnv = mapf_gym.MAPFEnv(num_agents=num_agents, DIAGONAL_MOVEMENT=DIAG_MVMT, SIZE=ENVIRONMENT_SIZE, 
+                                observation_size=GRID_SIZE,PROB=OBSTACLE_DENSITY, FULL_HELP=FULL_HELP)
+    
+    # manager = mp.Manager()
+    
+# workers=[]
 
-if not TRAINING:
-    print([np.mean(plan_durations), np.sqrt(np.var(plan_durations)), np.mean(np.asarray(plan_durations < max_episode_length, dtype=float))])
+# workers=Worker(master_network,gameEnv,i,optimizer,a_size)
+    
+    
+    
+    
+    # worker_class=Worker(master_network,gameEnv,optimizer,a_size)
+
+  
+lock = mp.Lock()
+barrier = mp.Barrier(num_agents)
+    
+
+if __name__ == "__main__":
+        
+        
+        Worker(master_network,optimizer,a_size)
+        processes = []
+        for i in range(1,num_agents+1):
+            
+            # worker = workersTmp[rank-1]
+            p = mp.Process(target=worker_function,args=(i,max_episode_length,gamma,lock,barrier))
+            p.start()
+            processes.append(p)
+            time.sleep(0.001)
+        for p in processes:
+            time.sleep(0.001)
+            p.join()
+
+
+        
+
+# if not TRAINING:
+    # print([np.mean(plan_durations), np.sqrt(np.var(plan_durations)), np.mean(np.asarray(plan_durations < max_episode_length, dtype=float))])
 
 
 

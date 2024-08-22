@@ -11,7 +11,16 @@ import math
 import copy
 from od_mstar3 import cpp_mstar
 from od_mstar3.col_set_addition import NoSolutionError, OutOfTimeError
-# from gym.envs.classic_control import rendering  #in gym version gym version 0.21.0 it works      
+import torch.multiprocessing as mp
+from multiprocessing import Lock, Array
+import torch
+# from gym.envs.classic_control import rendering  #in gym version gym version 0.21.0 it works
+#      
+manager = mp.Manager()
+shared_dict_obs = manager.dict()
+shared_dict_valid_act=manager.dict()
+
+
 
 '''
     Observation: (position maps of current agent, current goal, other agents, other goals, obstacles)
@@ -33,109 +42,120 @@ actionDict={v:k for k,v in dirDict.items()}
 #     return colorsys.hsv_to_rgb(h,s,v)
 
 
-class State(object):
-    '''
-    State.
-    Implemented as 2 2d numpy arrays.
-    first one "state":
-        static obstacle: -1
-        empty: 0
-        agent = positive integer (agent_id)
-    second one "goals":
-        agent goal = positive int(agent_id)
-    '''
-    def __init__(self, world0, goals, diagonal, num_agents=1):
+# class State(object):
+'''
+State.
+Implemented as 2 2d numpy arrays.
+first one "state":
+    static obstacle: -1
+    empty: 0
+    agent = positive integer (agent_id)
+second one "goals":
+    agent goal = positive int(agent_id)
+'''
+def init_state(world0, goals, diagonal, num_agents=1):
 
-        print("here")
-        assert(len(world0.shape) == 2 and world0.shape==goals.shape)
-        self.state                    = world0.copy()
-        self.goals                    = goals.copy()
-        self.num_agents               = num_agents
-        self.agents, self.agents_past, self.agent_goals = self.scanForAgents()
-        self.diagonal=diagonal
-        assert(len(self.agents) == num_agents)
+    print("here")
+    assert(len(world0.shape) == 2 and world0.shape==goals.shape)
 
-    def scanForAgents(self):
-        agents = [(-1,-1) for i in range(self.num_agents)]
-        agents_last = [(-1,-1) for i in range(self.num_agents)]        
-        agent_goals = [(-1,-1) for i in range(self.num_agents)]        
-        for i in range(self.state.shape[0]):
-            for j in range(self.state.shape[1]):
-                if(self.state[i,j]>0):
-                    agents[self.state[i,j]-1] = (i,j)
-                    agents_last[self.state[i,j]-1] = (i,j)
-                if(self.goals[i,j]>0):
-                    agent_goals[self.goals[i,j]-1] = (i,j)
-        assert((-1,-1) not in agents and (-1,-1) not in agent_goals)
-        assert(agents==agents_last)
-        # print("scanned_for_agents")
-        # print("agents=",agents,"agents_last=",agents_last,"agent_goals=",agent_goals) #farhan
-        return agents, agents_last, agent_goals
+    # # Convert numpy arrays to shared memory
+    # world,goals = store_the_reseted_world_to_share(world0,goals)
+    # #convert back to numpy array
+    # self.state =world.numpy()
+    # self.goals =goals.numpy()
+    # self.lock = Lock()
+    state                    = torch.tensor(world0).share_memory_()
+    goals                    = torch.tensor(goals).share_memory_()
+    num_agents               = num_agents
+    agents, agents_past, agent_goals = scanForAgents(num_agents, state, goals)
+    # assert(len(self.agents) == num_agents)
+    return {'state':state, 'goals':goals, 'num_agents':num_agents, 'agents':agents, 'agents_past':agents_past, 'agent_goals':agent_goals, 'diagonal':diagonal }
 
-    def getPos(self, agent_id):
-        return self.agents[agent_id-1]
+def scanForAgents(num_agents, state, goals):
+    agents = [(-1,-1) for i in range(num_agents)]
+    agents_last = [(-1,-1) for i in range(num_agents)]        
+    agent_goals = [(-1,-1) for i in range(num_agents)]        
+    for i in range(state.shape[0]):
+        for j in range(state.shape[1]):
+            if(state[i,j]>0):
+                agents[state[i,j]-1] = (i,j)
+                agents_last[state[i,j]-1] = (i,j)
+            if(goals[i,j]>0):
+                agent_goals[goals[i,j]-1] = (i,j)
+    assert((-1,-1) not in agents and (-1,-1) not in agent_goals)
+    assert(agents==agents_last)
+    # print("scanned_for_agents")
+    # print("agents=",agents,"agents_last=",agents_last,"agent_goals=",agent_goals) #farhan
+    return agents, agents_last, agent_goals
 
-    def getPastPos(self, agent_id):
-        return self.agents_past[agent_id-1]
+def getPos(agent_id, agents):
+    # with self.lock:
+    return agents[agent_id-1]
 
-    def getGoal(self, agent_id):
-        return self.agent_goals[agent_id-1]
+def getPastPos(agent_id, agents_past):
+    # with self.lock:
+    return agents_past[agent_id-1]
+
+def getGoal(agent_id, agent_goals):
+    # with self.lock:
+    return agent_goals[agent_id-1]
     
-    def diagonalCollision(self, agent_id, newPos):
-        '''diagonalCollision(id,(x,y)) returns true if agent with id "id" collided diagonally with 
-        any other agent in the state after moving to coordinates (x,y)
-        agent_id: id of the desired agent to check for
-        newPos: coord the agent is trying to move to (and checking for collisions)
-        '''
+def diagonalCollision(agent_id, newPos, agents, num_agents, agents_past):
+    '''diagonalCollision(id,(x,y)) returns true if agent with id "id" collided diagonally with 
+    any other agent in the state after moving to coordinates (x,y)
+    agent_id: id of the desired agent to check for
+    newPos: coord the agent is trying to move to (and checking for collisions)
+    '''
 #        def eq(f1,f2):return abs(f1-f2)<0.001
-        def collide(a1,a2,b1,b2):
-            '''
-            a1,a2 are coords for agent 1, b1,b2 coords for agent 2, returns true if these collide diagonally
-            '''
-            return np.isclose( (a1[0]+a2[0]) /2. , (b1[0]+b2[0])/2. ) and np.isclose( (a1[1]+a2[1])/2. , (b1[1]+b2[1])/2. )
-        assert(len(newPos) == 2);
-        #up until now we haven't moved the agent, so getPos returns the "old" location
-        lastPos = self.getPos(agent_id)
-        for agent in range(1,self.num_agents+1):
-            if agent == agent_id: continue
-            aPast = self.getPastPos(agent)
-            aPres = self.getPos(agent)
-            if collide(aPast,aPres,lastPos,newPos): return True
-        return False
+    def collide(a1,a2,b1,b2):
+        '''
+        a1,a2 are coords for agent 1, b1,b2 coords for agent 2, returns true if these collide diagonally
+        '''
+        return np.isclose( (a1[0]+a2[0]) /2. , (b1[0]+b2[0])/2. ) and np.isclose( (a1[1]+a2[1])/2. , (b1[1]+b2[1])/2. )
+    assert(len(newPos) == 2)
+    #up until now we haven't moved the agent, so getPos returns the "old" location
+    lastPos = getPos(agent_id, agents)
+    for agent in range(1,num_agents+1):
+        if agent == agent_id: continue
+        aPast = getPastPos(agent, agents_past)
+        aPres = getPos(agent, agents)
+        if collide(aPast,aPres,lastPos,newPos): return True
+    return False
 
-    #try to move agent and return the status
-    def moveAgent(self, direction, agent_id):
-        ax=self.agents[agent_id-1][0]
-        ay=self.agents[agent_id-1][1]
+#try to move agent and return the status
+def moveAgent(direction, agent_id, agents,agents_past, goals, state, diagonal):
+    # with self.lock:
+    ax=agents[agent_id-1][0]
+    ay=agents[agent_id-1][1]
 
-        # Not moving is always allowed
-        if(direction==(0,0)):
-            self.agents_past[agent_id-1]=self.agents[agent_id-1]
-            return 1 if self.goals[ax,ay]==agent_id else 0
+    # Not moving is always allowed
+    if(direction==(0,0)):
+        agents_past[agent_id-1]=agents[agent_id-1]
+        return 1 if goals[ax,ay]==agent_id else 0
 
-        # Otherwise, let's look at the validity of the move
-        dx,dy =direction[0], direction[1]
-        if(ax+dx>=self.state.shape[0] or ax+dx<0 or ay+dy>=self.state.shape[1] or ay+dy<0):#out of bounds
-            return -1
-        if(self.state[ax+dx,ay+dy]<0):#collide with static obstacle
-            return -2
-        if(self.state[ax+dx,ay+dy]>0):#collide with robot
+    # Otherwise, let's look at the validity of the move
+    dx,dy =direction[0], direction[1]
+    if(ax+dx>=state.shape[0] or ax+dx<0 or ay+dy>=state.shape[1] or ay+dy<0):#out of bounds
+        return -1
+    if(state[ax+dx,ay+dy]<0):#collide with static obstacle
+        return -2
+    if(state[ax+dx,ay+dy]>0):#collide with robot
+        return -3
+    # check for diagonal collisions
+    if(diagonal):
+        if diagonalCollision(agent_id,(ax+dx,ay+dy), agents,num_agents,agents_past):
             return -3
-        # check for diagonal collisions
-        if(self.diagonal):
-            if self.diagonalCollision(agent_id,(ax+dx,ay+dy)):
-                return -3
-        # No collision: we can carry out the action
-        self.state[ax,ay] = 0
-        self.state[ax+dx,ay+dy] = agent_id
-        self.agents_past[agent_id-1]=self.agents[agent_id-1]
-        self.agents[agent_id-1] = (ax+dx,ay+dy)
-        if self.goals[ax+dx,ay+dy]==agent_id:
-            return 1
-        elif self.goals[ax+dx,ay+dy]!=agent_id and self.goals[ax,ay]==agent_id:
-            return 2
-        else:
-            return 0
+    # No collision: we can carry out the action
+    state[ax,ay] = 0
+    state[ax+dx,ay+dy] = agent_id
+    agents_past[agent_id-1]=agents[agent_id-1]
+    agents[agent_id-1] = (ax+dx,ay+dy)
+    if goals[ax+dx,ay+dy]==agent_id:
+        return 1
+    elif goals[ax+dx,ay+dy]!=agent_id and goals[ax,ay]==agent_id:
+        return 2
+    else:
+        return 0
 
     # try to execture action and return whether action was executed or not and why
     #returns:
@@ -145,26 +165,29 @@ class State(object):
     #    -1: out of bounds
     #    -2: collision with wall
     #    -3: collision with robot
-    def act(self, action, agent_id):
-        # 0     1  2  3  4 
-        # still N  E  S  W
-        direction = self.getDir(action)
-        moved = self.moveAgent(direction,agent_id)
-        return moved
+def getDir(action):
+    return dirDict[action]
 
-    def getDir(self,action):
-        return dirDict[action]
-    def getAction(self,direction):
-        return actionDict[direction]
+def act(action, agent_id, agents,agents_past, goals, state, diagonal):
+    # 0     1  2  3  4 
+    # still N  E  S  W
+    direction = getDir(action)
+    moved = moveAgent(direction,agent_id, agents,agents_past, goals, state, diagonal)
+    return moved
 
-    # Compare with a plan to determine job completion
-    def done(self):
-        numComplete = 0
-        for i in range(1,len(self.agents)+1):
-            agent_pos = self.agents[i-1]
-            if self.goals[agent_pos[0],agent_pos[1]] == i:
-                numComplete += 1
-        return numComplete==len(self.agents) #, numComplete/float(len(self.agents))
+
+def getAction(direction):
+    return actionDict[direction]
+
+# Compare with a plan to determine job completion
+def done(agents, goals):
+    # with self.lock:
+    numComplete = 0
+    for i in range(1,len(agents)+1):
+        agent_pos = agents[i-1]
+        if goals[agent_pos[0],agent_pos[1]] == i:
+            numComplete += 1
+    return numComplete==len(agents) #, numComplete/float(len(self.agents))
 
 
 class MAPFEnv(gym.Env):
@@ -231,18 +254,18 @@ class MAPFEnv(gym.Env):
             return True
 
     def getObstacleMap(self):
-        return (self.world.state==-1).astype(int)
+        return (self.world['state']==-1).astype(int)
     
     def getGoals(self):
         result=[]
         for i in range(1,self.num_agents+1):
-            result.append(self.world.getGoal(i))
+            result.append(getGoal(i, self.world['agent_goals']))
         return result
     
     def getPositions(self):
         result=[]
         for i in range(1,self.num_agents+1):
-            result.append(self.world.getPos(i))
+            result.append(getPos(i, self.world['agents']))
         return result
     
     def _setWorld(self, world0=None, goals0=None,blank_world=False):
@@ -304,12 +327,12 @@ class MAPFEnv(gym.Env):
                         goal_counter += 1
                 self.initial_world = world0.copy()
                 self.initial_goals = goals0.copy()
-                self.world = State(self.initial_world,self.initial_goals,self.DIAGONAL_MOVEMENT,self.num_agents)
+                self.world = init_state(self.initial_world,self.initial_goals,self.DIAGONAL_MOVEMENT,self.num_agents)
                 print("here")
                 return
             self.initial_world = world0
             self.initial_goals = goals0
-            self.world = State(world0,goals0,self.DIAGONAL_MOVEMENT,self.num_agents)
+            self.world = init_state(world0,goals0,self.DIAGONAL_MOVEMENT,self.num_agents)
 
             print("....................................inside sETWORL if condition.........................")
             return
@@ -345,19 +368,27 @@ class MAPFEnv(gym.Env):
                 goal_counter += 1
         self.initial_world = world
         self.initial_goals = goals
+        world1=torch.tensor(world).share_memory_()
+        goals1=torch.tensor(goals).share_memory_()
 
-        # print("self.initial_world=",self.initial_world)
-        # print("self.initial_goals",self.initial_goals)
+        # Convert numpy arrays to shared memory
+        # world,goals = store_the_reseted_world_to_share(world,goals)
+        
+        #convert back to numpy array
+        # world =world.numpy()
+        # goals =goals.numpy()
 
-        # print("Goals of the all  agents in FOV =",goals) #farhan
-        print("....................................inside sETWORL.........................")
-        self.world = State(world,goals,self.DIAGONAL_MOVEMENT,num_agents=self.num_agents)
-        # print("self.world",self.world)
+        # Initialize the shared State class
+        print("new world created")
+        self.world = init_state(world1, goals1,self.DIAGONAL_MOVEMENT,num_agents=self.num_agents)
+        # print(self.world, self.world['agents'])
+       
+
 
     # Returns an observation of an agent
     def _observe(self,agent_id):
         assert(agent_id>0)
-        top_left=(self.world.getPos(agent_id)[0]-self.observation_size//2,self.world.getPos(agent_id)[1]-self.observation_size//2)
+        top_left=(getPos(agent_id, self.world['agents'])[0]-self.observation_size//2,getPos(agent_id, self.world['agents'])[1]-self.observation_size//2)
         bottom_right=(top_left[0]+self.observation_size,top_left[1]+self.observation_size)        
         obs_shape=(self.observation_size,self.observation_size)
         goal_map             = np.zeros(obs_shape)
@@ -367,37 +398,50 @@ class MAPFEnv(gym.Env):
         visible_agents=[]
         for i in range(top_left[0],top_left[0]+self.observation_size):
             for j in range(top_left[1],top_left[1]+self.observation_size):
-                if i>=self.world.state.shape[0] or i<0 or j>=self.world.state.shape[1] or j<0:
+                if i>=self.world['state'].shape[0] or i<0 or j>=self.world['state'].shape[1] or j<0:
                     #out of bounds, just treat as an obstacle
                     obs_map[i-top_left[0],j-top_left[1]]=1
                     continue
-                if self.world.state[i,j]==-1:
+                if self.world['state'][i,j]==-1:
                     #obstacles
                     obs_map[i-top_left[0],j-top_left[1]]=1
-                if self.world.state[i,j]==agent_id:
+                if self.world['state'][i,j]==agent_id:
                     #agent's position
                     poss_map[i-top_left[0],j-top_left[1]]=1
-                if self.world.goals[i,j]==agent_id:
+                if self.world['goals'][i,j]==agent_id:
                     #agent's goal
                     goal_map[i-top_left[0],j-top_left[1]]=1
-                if self.world.state[i,j]>0 and self.world.state[i,j]!=agent_id:
+                if self.world['state'][i,j]>0 and self.world['state'][i,j]!=agent_id:
                     #other agents' positions
-                    visible_agents.append(self.world.state[i,j])
+                    visible_agents.append(self.world['state'][i,j])
                     poss_map[i-top_left[0],j-top_left[1]]=1
 
         for agent in visible_agents:
-            x, y = self.world.getGoal(agent)
+            x, y = getGoal(agent, self.world['agent_goals'])
             min_node = (max(top_left[0], min(top_left[0] + self.observation_size - 1, x)),
                         max(top_left[1], min(top_left[1] + self.observation_size - 1, y)))
             goals_map[min_node[0] - top_left[0], min_node[1] - top_left[1]] = 1
 
-        dx=self.world.getGoal(agent_id)[0]-self.world.getPos(agent_id)[0]
-        dy=self.world.getGoal(agent_id)[1]-self.world.getPos(agent_id)[1]
+        dx=getGoal(agent_id, self.world['agent_goals'])[0]-getPos(agent_id, self.world['agents'])[0]  
+        dy=getGoal(agent_id, self.world['agent_goals'])[1]-getPos(agent_id, self.world['agents'])[1]
         mag=(dx**2+dy**2)**.5 # magnitude for finidng unit vector to the goal 
         if mag!=0:
             dx=dx/mag
             dy=dy/mag
-        return ([poss_map,goal_map,goals_map,obs_map],[dx,dy,mag])
+
+        
+        
+        poss_map=torch.tensor(1,dtype=torch.float32).share_memory_()
+        goal_map=torch.tensor(2,dtype=torch.float32).share_memory_()
+        goals_map=torch.tensor(3,dtype=torch.float32).share_memory_()
+        obs_map=torch.tensor(4,dtype=torch.float32).share_memory_()
+        dx= torch.tensor(dx).share_memory_()
+        dy= torch.tensor(dy).share_memory_()
+        mag=torch.tensor(mag).share_memory_()
+        
+        # shared_dict[agent_id] = [[poss_map,goal_map,goals_map,obs_map],[dx,dy,mag]]
+        shared_dict_obs[agent_id] = mag
+        return shared_dict_obs
 
 
 
@@ -414,15 +458,15 @@ class MAPFEnv(gym.Env):
         # self.mutex.release()
         if self.viewer is not None:
             self.viewer = None
-        on_goal = self.world.getPos(agent_id) == self.world.getGoal(agent_id)
+        on_goal = getPos(agent_id, self.world['agents']) == getGoal(agent_id, self.world['agent_goals'])
         #we assume you don't start blocking anyone (the probability of this happening is insanely low)
         return self._listNextValidActions(agent_id), on_goal,False
 
     def _complete(self):
-        return self.world.done()
+        return done(self.world['agents'], self.world['goals'])
     
     def getAstarCosts(self,start, goal):
-        #returns a numpy array of same dims as self.world.state with the distance to the goal from each coord
+        #returns a numpy array of same dims as self.world['state'] with the distance to the goal from each coord
         def lowestF(fScore,openSet):
             #find entry in openSet with lowest fScore
             assert(len(openSet)>0)
@@ -439,14 +483,14 @@ class MAPFEnv(gym.Env):
             n_moves=9 if self.DIAGONAL_MOVEMENT else 5
             neighbors=set()
             for move in range(1,n_moves):#we dont want to include 0 or it will include itself
-                direction=self.world.getDir(move)
+                direction=getDir(move)
                 dx=direction[0]
                 dy=direction[1]
                 ax=node[0]
                 ay=node[1]
-                if(ax+dx>=self.world.state.shape[0] or ax+dx<0 or ay+dy>=self.world.state.shape[1] or ay+dy<0):#out of bounds
+                if(ax+dx>=self.world['state'].shape[0] or ax+dx<0 or ay+dy>=self.world['state'].shape[1] or ay+dy<0):#out of bounds
                     continue
-                if(self.world.state[ax+dx,ay+dy]==-1):#collide with static obstacle
+                if(self.world['state'][ax+dx,ay+dy]==-1):#collide with static obstacle
                     continue
                 neighbors.add((ax+dx,ay+dy))
             return neighbors
@@ -508,7 +552,7 @@ class MAPFEnv(gym.Env):
                 fScore[neighbor] = gScore[neighbor] + heuristic_cost_estimate(neighbor, goal) 
     
         #parse through the gScores
-        costs=self.world.state.copy()
+        costs=self.world['state'].copy()
         for (i,j) in gScore:
             costs[i,j]=gScore[i,j]
         return costs
@@ -532,11 +576,11 @@ class MAPFEnv(gym.Env):
         other_robots=[]
         other_locations=[]
         inflation=10
-        top_left=(self.world.getPos(agent_id)[0]-self.observation_size//2,self.world.getPos(agent_id)[1]-self.observation_size//2)
+        top_left=(getPos(agent_id, self.world['agents'])[0]-self.observation_size//2,getPos(agent_id, self.world['agents'])[1]-self.observation_size//2)
         bottom_right=(top_left[0]+self.observation_size,top_left[1]+self.observation_size)        
         for agent in range(1,self.num_agents):
             if agent==agent_id: continue
-            x,y=self.world.getPos(agent)
+            x,y=getPos(agent, self.world['agents'])
             if x<top_left[0] or x>=bottom_right[0] or y>=bottom_right[1] or y<top_left[1]:
                 continue
             other_robots.append(agent)
@@ -544,14 +588,14 @@ class MAPFEnv(gym.Env):
         num_blocking=0
         world=self.getObstacleMap()
         for agent in other_robots:
-            other_locations.remove(self.world.getPos(agent))
+            other_locations.remove(getPos(agent, self.world['agents']))
             #before removing
-            path_before=self.astar(world,self.world.getPos(agent),self.world.getGoal(agent),
-                                   robots=other_locations+[self.world.getPos(agent_id)])
+            path_before=self.astar(world,getPos(agent, self.world['agents']),getGoal(agent, self.world['agent_goals']),
+                                   robots=other_locations+[getPos(agent_id, self.world['agents'])])
             #after removing
-            path_after=self.astar(world,self.world.getPos(agent),self.world.getGoal(agent),
+            path_after=self.astar(world,getPos(agent, self.world['agents']),getGoal(agent, self.world['agent_goals']),
                                    robots=other_locations)
-            other_locations.append(self.world.getPos(agent))
+            other_locations.append(getPos(agent, self.world['agents']))
             if (path_before is None and path_after is None):continue
             if (path_before is not None and path_after is None):continue
             if (path_before is None and path_after is not None)\
@@ -579,10 +623,10 @@ class MAPFEnv(gym.Env):
         # self.mutex.acquire()
 
         #get start location of agent
-        agentStartLocation = self.world.getPos(agent_id)
+        agentStartLocation = getPos(agent_id, self.world['agents'])
         
         # Execute action & determine reward
-        action_status = self.world.act(action,agent_id)
+        action_status = act(action,agent_id, self.world['agents'], self.world['agents_past'], self.world['goals'], self.world['state'], self.world['diagonal'])
         valid_action=action_status >=0
         #     2: action executed and left goal
         #     1: action executed and reached/stayed on goal
@@ -619,9 +663,9 @@ class MAPFEnv(gym.Env):
                 #tally up the visible agents
                 if agent==agent_id:
                     continue
-                top_left=(self.world.getPos(agent_id)[0]-self.observation_size//2, \
-                          self.world.getPos(agent_id)[1]-self.observation_size//2)
-                pos=self.world.getPos(agent)
+                top_left=(getPos(agent_id, self.world['agents'])[0]-self.observation_size//2, \
+                          getPos(agent_id, self.world['agents'])[1]-self.observation_size//2)
+                pos=getPos(agent, self.world['agents'])
                 if pos[0]>=top_left[0] and pos[0]<top_left[0]+self.observation_size\
                     and pos[1]>=top_left[1] and pos[1]<top_left[1]+self.observation_size:
                         #if the agent is within the bounds for observation
@@ -638,156 +682,105 @@ class MAPFEnv(gym.Env):
         state = self._observe(agent_id) 
 
         # Done?
-        done = self.world.done()
-        self.finished |= done
+        doneVar = done(self.world['agents'], self.world['goals'])
+        self.finished |= doneVar
 
         # next valid actions
         nextActions = self._listNextValidActions(agent_id, action,episode=episode)
 
         # on_goal estimation
-        on_goal = self.world.getPos(agent_id) == self.world.getGoal(agent_id)
+        on_goal = getPos(agent_id, self.world['agents']) == getGoal(agent_id, self.world['agent_goals'])
         
         # Unlock mutex
         # self.mutex.release()
-        return state, reward, done, nextActions, on_goal, blocking, valid_action
+        return state, reward, doneVar, nextActions, on_goal, blocking, valid_action
 
     def _listNextValidActions(self, agent_id, prev_action=0,episode=0):
         available_actions = [0] # staying still always allowed
 
         # Get current agent position
-        agent_pos = self.world.getPos(agent_id)
+        agent_pos = getPos(agent_id, self.world['agents'])
         ax,ay     = agent_pos[0],agent_pos[1]
         n_moves   = 9 if self.DIAGONAL_MOVEMENT else 5
 
         for action in range(1,n_moves):
-            direction = self.world.getDir(action)
+            direction = getDir(action)
             dx,dy     = direction[0],direction[1]
-            if(ax+dx>=self.world.state.shape[0] or ax+dx<0 or ay+dy>=self.world.state.shape[1] or ay+dy<0):#out of bounds
+            if(ax+dx>=self.world['state'].shape[0] or ax+dx<0 or ay+dy>=self.world['state'].shape[1] or ay+dy<0):#out of bounds
                 continue
-            if(self.world.state[ax+dx,ay+dy]<0):#collide with static obstacle
+            if(self.world['state'][ax+dx,ay+dy]<0):#collide with static obstacle
                 continue
-            if(self.world.state[ax+dx,ay+dy]>0):#collide with robot
+            if(self.world['state'][ax+dx,ay+dy]>0):#collide with robot
                 continue
             # check for diagonal collisions
             if(self.DIAGONAL_MOVEMENT):
-                if self.world.diagonalCollision(agent_id,(ax+dx,ay+dy)):
+                if diagonalCollision(agent_id,(ax+dx,ay+dy), self.world['agents'], self.world['num_agents'], self.world['agents_past']):
                     continue          
             #otherwise we are ok to carry out the action
             available_actions.append(action)
 
         if opposite_actions[prev_action] in available_actions:
             available_actions.remove(opposite_actions[prev_action])
-                
-        return available_actions
+        
+        shared_dict_valid_act[agent_id]=torch.tensor(available_actions).share_memory_()      
+        return shared_dict_valid_act
 
-    # def drawStar(self, centerX, centerY, diameter, numPoints, color):
-    #     outerRad=diameter//2
-    #     innerRad=int(outerRad*3/8)
-    #     #fill the center of the star
-    #     angleBetween=2*math.pi/numPoints#angle between star points in radians
-    #     for i in range(numPoints):
-    #         #p1 and p3 are on the inner radius, and p2 is the point
-    #         pointAngle=math.pi/2+i*angleBetween
-    #         p1X=centerX+innerRad*math.cos(pointAngle-angleBetween/2)
-    #         p1Y=centerY-innerRad*math.sin(pointAngle-angleBetween/2)
-    #         p2X=centerX+outerRad*math.cos(pointAngle)
-    #         p2Y=centerY-outerRad*math.sin(pointAngle)
-    #         p3X=centerX+innerRad*math.cos(pointAngle+angleBetween/2)
-    #         p3Y=centerY-innerRad*math.sin(pointAngle+angleBetween/2)
-    #         #draw the triangle for each tip.
-    #         poly=rendering.FilledPolygon([(p1X,p1Y),(p2X,p2Y),(p3X,p3Y)])
-    #         poly.set_color(color[0],color[1],color[2])
-    #         poly.add_attr(rendering.Transform())
-    #         self.viewer.add_onetime(poly)
-
-    # def create_rectangle(self,x,y,width,height,fill,permanent=False):
-    #     ps=[(x,y),((x+width),y),((x+width),(y+height)),(x,(y+height))]
-    #     rect=rendering.FilledPolygon(ps)
-    #     rect.set_color(fill[0],fill[1],fill[2])
-    #     rect.add_attr(rendering.Transform())
-    #     if permanent:
-    #         self.viewer.add_geom(rect)
-    #     else:
-    #         self.viewer.add_onetime(rect)
-    # def create_circle(self,x,y,diameter,size,fill,resolution=20):
-    #     c=(x+size/2,y+size/2)
-    #     dr=math.pi*2/resolution
-    #     ps=[]
-    #     for i in range(resolution):
-    #         x=c[0]+math.cos(i*dr)*diameter/2
-    #         y=c[1]+math.sin(i*dr)*diameter/2
-    #         ps.append((x,y))
-    #     circ=rendering.FilledPolygon(ps)
-    #     circ.set_color(fill[0],fill[1],fill[2])
-    #     circ.add_attr(rendering.Transform())
-    #     self.viewer.add_onetime(circ)
     
-    # def initColors(self):
-    #     # c={a+1:hsv_to_rgb_numpy(a/float(self.num_agents),1,1) for a in range(self.num_agents)}
-    #     # return c
-    #     c={a+1:hsv_to_rgb(np.array([a/float(self.num_agents),1,1])) for a in range(self.num_agents)}
-    #     return c
-
-    # def _render(self, mode='human',close=False,screen_width=800,screen_height=800,action_probs=None):
-    #     if close == True:
-    #         return
-    #     #values is an optional parameter which provides a visualization for the value of each agent per step
-    #     size=screen_width/max(self.world.state.shape[0],self.world.state.shape[1])
-    #     colors=self.initColors()
-    #     if self.viewer==None:
-    #         self.viewer=rendering.Viewer(screen_width,screen_height)
-    #         self.reset_renderer=True
-    #     if self.reset_renderer:
-    #         self.create_rectangle(0,0,screen_width,screen_height,(.6,.6,.6),permanent=True)
-    #         for i in range(self.world.state.shape[0]):
-    #             start=0
-    #             end=1
-    #             scanning=False
-    #             write=False
-    #             for j in range(self.world.state.shape[1]):
-    #                 if(self.world.state[i,j]!=-1 and not scanning):#free
-    #                     start=j
-    #                     scanning=True
-    #                 if((j==self.world.state.shape[1]-1 or self.world.state[i,j]==-1) and scanning):
-    #                     end=j+1 if j==self.world.state.shape[1]-1 else j
-    #                     scanning=False
-    #                     write=True
-    #                 if write:
-    #                     x=i*size
-    #                     y=start*size
-    #                     self.create_rectangle(x,y,size,size*(end-start),(1,1,1),permanent=True)
-    #                     write=False
-    #     for agent in range(1,self.num_agents+1):
-    #         i,j=self.world.getPos(agent)
-    #         x=i*size
-    #         y=j*size
-    #         color=colors[self.world.state[i,j]]
-    #         self.create_rectangle(x,y,size,size,color)
-    #         i,j=self.world.getGoal(agent)
-    #         x=i*size
-    #         y=j*size
-    #         color=colors[self.world.goals[i,j]]
-    #         self.create_circle(x,y,size,size,color)
-    #         if self.world.getGoal(agent)==self.world.getPos(agent):
-    #             color=(0,0,0)
-    #             self.create_circle(x,y,size,size,color)
-    #     if action_probs is not None:
-    #         n_moves=9 if self.DIAGONAL_MOVEMENT else 5
-    #         for agent in range(1,self.num_agents+1):
-    #             #take the a_dist from the given data and draw it on the frame
-    #             a_dist=action_probs[agent-1]
-    #             if a_dist is not None:
-    #                 for m in range(n_moves):
-    #                     dx,dy=self.world.getDir(m)
-    #                     x=(self.world.getPos(agent)[0]+dx)*size
-    #                     y=(self.world.getPos(agent)[1]+dy)*size
-    #                     s=a_dist[m]*size
-    #                     self.create_circle(x,y,s,size,(0,0,0))
-    #     self.reset_renderer=False
-    #     result=self.viewer.render(return_rgb_array = mode=='rgb_array')
-    #     return result
+def worker(agent_id,env,episode_count,lock,barrier):
+    
+    cur_pos=env.getPositions()
+    goals=env.getGoals()
+    # print("before step agent=",agent_id,cur_pos,goals)
+    print("before step") 
+    barrier.wait()
+    with lock:
+        observation  = env._observe(agent_id)
+        validActions = env._listNextValidActions(agent_id)
+        a=random.choice(validActions[agent_id].tolist())
+    
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    barrier.wait()
+    with lock:
+        state, reward, done, nextActions, on_goal, blocking, valid_action=env._step((agent_id,a))
+    barrier.wait()
+    print("after 1 step") 
+    with lock:
+        validActions = env._listNextValidActions(agent_id,a)
+        a=random.choice(validActions[agent_id].tolist())
+        observation=env._observe(agent_id)
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    barrier.wait()
+    # cur_pos=env.getPositions()
+    # goals=env.getGoals()
+    # print("after step agent=",agent_id,cur_pos,goals)
+    if agent_id==2:
+        env._reset(agent_id)
+    
+    barrier.wait()
+    print("after reset")
+    with lock:
+        observation=env._observe(agent_id)
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    
 
 if __name__=='__main__':
-    n_agents=2
-    env=MAPFEnv(n_agents,PROB=(.3,.5),SIZE=(10,11),DIAGONAL_MOVEMENT=False)
-    print(env)
+    num_agents=2
+    env=MAPFEnv(num_agents,PROB=(.3,.5),SIZE=(10,11),DIAGONAL_MOVEMENT=False)
+    world=env.world
+    episode_count=mp.Value('i', 0)
+    lock = mp.Lock()
+    barrier = mp.Barrier(num_agents)
+    
+    
+    processes = []
+    for agent_id in range(1,num_agents+1):
+        print(f'worker {agent_id}: started')
+        p = mp.Process(target=worker, args=(agent_id,env,episode_count,lock,barrier))
+        p.start()
+        processes.append(p)
+    
+    for p in processes:
+        p.join()

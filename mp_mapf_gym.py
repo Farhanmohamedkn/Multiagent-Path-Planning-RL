@@ -11,7 +11,16 @@ import math
 import copy
 from od_mstar3 import cpp_mstar
 from od_mstar3.col_set_addition import NoSolutionError, OutOfTimeError
-# from gym.envs.classic_control import rendering  #in gym version gym version 0.21.0 it works      
+import torch.multiprocessing as mp
+from multiprocessing import Lock, Array
+import torch
+# from gym.envs.classic_control import rendering  #in gym version gym version 0.21.0 it works
+#      
+manager = mp.Manager()
+shared_dict_obs = manager.dict()
+shared_dict_valid_act=manager.dict()
+
+
 
 '''
     Observation: (position maps of current agent, current goal, other agents, other goals, obstacles)
@@ -48,8 +57,15 @@ class State(object):
 
         print("here")
         assert(len(world0.shape) == 2 and world0.shape==goals.shape)
-        self.state                    = world0.copy()
-        self.goals                    = goals.copy()
+
+        # # Convert numpy arrays to shared memory
+        # world,goals = store_the_reseted_world_to_share(world0,goals)
+        # #convert back to numpy array
+        # self.state =world.numpy()
+        # self.goals =goals.numpy()
+        self.lock = Lock()
+        self.state                    = torch.tensor(world0).share_memory_()
+        self.goals                    = torch.tensor(goals).share_memory_()
         self.num_agents               = num_agents
         self.agents, self.agents_past, self.agent_goals = self.scanForAgents()
         self.diagonal=diagonal
@@ -73,13 +89,16 @@ class State(object):
         return agents, agents_last, agent_goals
 
     def getPos(self, agent_id):
-        return self.agents[agent_id-1]
+        with self.lock:
+            return self.agents[agent_id-1]
 
     def getPastPos(self, agent_id):
-        return self.agents_past[agent_id-1]
+        with self.lock:
+            return self.agents_past[agent_id-1]
 
     def getGoal(self, agent_id):
-        return self.agent_goals[agent_id-1]
+        with self.lock:
+            return self.agent_goals[agent_id-1]
     
     def diagonalCollision(self, agent_id, newPos):
         '''diagonalCollision(id,(x,y)) returns true if agent with id "id" collided diagonally with 
@@ -105,37 +124,38 @@ class State(object):
 
     #try to move agent and return the status
     def moveAgent(self, direction, agent_id):
-        ax=self.agents[agent_id-1][0]
-        ay=self.agents[agent_id-1][1]
+        with self.lock:
+                ax=self.agents[agent_id-1][0]
+                ay=self.agents[agent_id-1][1]
 
-        # Not moving is always allowed
-        if(direction==(0,0)):
-            self.agents_past[agent_id-1]=self.agents[agent_id-1]
-            return 1 if self.goals[ax,ay]==agent_id else 0
+                # Not moving is always allowed
+                if(direction==(0,0)):
+                    self.agents_past[agent_id-1]=self.agents[agent_id-1]
+                    return 1 if self.goals[ax,ay]==agent_id else 0
 
-        # Otherwise, let's look at the validity of the move
-        dx,dy =direction[0], direction[1]
-        if(ax+dx>=self.state.shape[0] or ax+dx<0 or ay+dy>=self.state.shape[1] or ay+dy<0):#out of bounds
-            return -1
-        if(self.state[ax+dx,ay+dy]<0):#collide with static obstacle
-            return -2
-        if(self.state[ax+dx,ay+dy]>0):#collide with robot
-            return -3
-        # check for diagonal collisions
-        if(self.diagonal):
-            if self.diagonalCollision(agent_id,(ax+dx,ay+dy)):
-                return -3
-        # No collision: we can carry out the action
-        self.state[ax,ay] = 0
-        self.state[ax+dx,ay+dy] = agent_id
-        self.agents_past[agent_id-1]=self.agents[agent_id-1]
-        self.agents[agent_id-1] = (ax+dx,ay+dy)
-        if self.goals[ax+dx,ay+dy]==agent_id:
-            return 1
-        elif self.goals[ax+dx,ay+dy]!=agent_id and self.goals[ax,ay]==agent_id:
-            return 2
-        else:
-            return 0
+                # Otherwise, let's look at the validity of the move
+                dx,dy =direction[0], direction[1]
+                if(ax+dx>=self.state.shape[0] or ax+dx<0 or ay+dy>=self.state.shape[1] or ay+dy<0):#out of bounds
+                    return -1
+                if(self.state[ax+dx,ay+dy]<0):#collide with static obstacle
+                    return -2
+                if(self.state[ax+dx,ay+dy]>0):#collide with robot
+                    return -3
+                # check for diagonal collisions
+                if(self.diagonal):
+                    if self.diagonalCollision(agent_id,(ax+dx,ay+dy)):
+                        return -3
+                # No collision: we can carry out the action
+                self.state[ax,ay] = 0
+                self.state[ax+dx,ay+dy] = agent_id
+                self.agents_past[agent_id-1]=self.agents[agent_id-1]
+                self.agents[agent_id-1] = (ax+dx,ay+dy)
+                if self.goals[ax+dx,ay+dy]==agent_id:
+                    return 1
+                elif self.goals[ax+dx,ay+dy]!=agent_id and self.goals[ax,ay]==agent_id:
+                    return 2
+                else:
+                    return 0
 
     # try to execture action and return whether action was executed or not and why
     #returns:
@@ -159,12 +179,13 @@ class State(object):
 
     # Compare with a plan to determine job completion
     def done(self):
-        numComplete = 0
-        for i in range(1,len(self.agents)+1):
-            agent_pos = self.agents[i-1]
-            if self.goals[agent_pos[0],agent_pos[1]] == i:
-                numComplete += 1
-        return numComplete==len(self.agents) #, numComplete/float(len(self.agents))
+        with self.lock:
+            numComplete = 0
+            for i in range(1,len(self.agents)+1):
+                agent_pos = self.agents[i-1]
+                if self.goals[agent_pos[0],agent_pos[1]] == i:
+                    numComplete += 1
+            return numComplete==len(self.agents) #, numComplete/float(len(self.agents))
 
 
 class MAPFEnv(gym.Env):
@@ -345,14 +366,21 @@ class MAPFEnv(gym.Env):
                 goal_counter += 1
         self.initial_world = world
         self.initial_goals = goals
+        world1=torch.tensor(world).share_memory_()
+        goals1=torch.tensor(goals).share_memory_()
 
-        # print("self.initial_world=",self.initial_world)
-        # print("self.initial_goals",self.initial_goals)
+        # Convert numpy arrays to shared memory
+        # world,goals = store_the_reseted_world_to_share(world,goals)
+        
+        #convert back to numpy array
+        # world =world.numpy()
+        # goals =goals.numpy()
 
-        # print("Goals of the all  agents in FOV =",goals) #farhan
-        print("....................................inside sETWORL.........................")
-        self.world = State(world,goals,self.DIAGONAL_MOVEMENT,num_agents=self.num_agents)
-        # print("self.world",self.world)
+        # Initialize the shared State class
+        print("new world created")
+        self.world = State(world1, goals1,self.DIAGONAL_MOVEMENT,num_agents=self.num_agents)
+       
+
 
     # Returns an observation of an agent
     def _observe(self,agent_id):
@@ -397,7 +425,20 @@ class MAPFEnv(gym.Env):
         if mag!=0:
             dx=dx/mag
             dy=dy/mag
-        return ([poss_map,goal_map,goals_map,obs_map],[dx,dy,mag])
+
+        
+        
+        poss_map=torch.tensor(1,dtype=torch.float32).share_memory_()
+        goal_map=torch.tensor(2,dtype=torch.float32).share_memory_()
+        goals_map=torch.tensor(3,dtype=torch.float32).share_memory_()
+        obs_map=torch.tensor(4,dtype=torch.float32).share_memory_()
+        dx= torch.tensor(dx).share_memory_()
+        dy= torch.tensor(dy).share_memory_()
+        mag=torch.tensor(mag).share_memory_()
+        
+        # shared_dict[agent_id] = [[poss_map,goal_map,goals_map,obs_map],[dx,dy,mag]]
+        shared_dict_obs[agent_id] = mag
+        return shared_dict_obs
 
 
 
@@ -677,117 +718,66 @@ class MAPFEnv(gym.Env):
 
         if opposite_actions[prev_action] in available_actions:
             available_actions.remove(opposite_actions[prev_action])
-                
-        return available_actions
+        
+        shared_dict_valid_act[agent_id]=torch.tensor(available_actions).share_memory_()      
+        return shared_dict_valid_act
 
-    # def drawStar(self, centerX, centerY, diameter, numPoints, color):
-    #     outerRad=diameter//2
-    #     innerRad=int(outerRad*3/8)
-    #     #fill the center of the star
-    #     angleBetween=2*math.pi/numPoints#angle between star points in radians
-    #     for i in range(numPoints):
-    #         #p1 and p3 are on the inner radius, and p2 is the point
-    #         pointAngle=math.pi/2+i*angleBetween
-    #         p1X=centerX+innerRad*math.cos(pointAngle-angleBetween/2)
-    #         p1Y=centerY-innerRad*math.sin(pointAngle-angleBetween/2)
-    #         p2X=centerX+outerRad*math.cos(pointAngle)
-    #         p2Y=centerY-outerRad*math.sin(pointAngle)
-    #         p3X=centerX+innerRad*math.cos(pointAngle+angleBetween/2)
-    #         p3Y=centerY-innerRad*math.sin(pointAngle+angleBetween/2)
-    #         #draw the triangle for each tip.
-    #         poly=rendering.FilledPolygon([(p1X,p1Y),(p2X,p2Y),(p3X,p3Y)])
-    #         poly.set_color(color[0],color[1],color[2])
-    #         poly.add_attr(rendering.Transform())
-    #         self.viewer.add_onetime(poly)
-
-    # def create_rectangle(self,x,y,width,height,fill,permanent=False):
-    #     ps=[(x,y),((x+width),y),((x+width),(y+height)),(x,(y+height))]
-    #     rect=rendering.FilledPolygon(ps)
-    #     rect.set_color(fill[0],fill[1],fill[2])
-    #     rect.add_attr(rendering.Transform())
-    #     if permanent:
-    #         self.viewer.add_geom(rect)
-    #     else:
-    #         self.viewer.add_onetime(rect)
-    # def create_circle(self,x,y,diameter,size,fill,resolution=20):
-    #     c=(x+size/2,y+size/2)
-    #     dr=math.pi*2/resolution
-    #     ps=[]
-    #     for i in range(resolution):
-    #         x=c[0]+math.cos(i*dr)*diameter/2
-    #         y=c[1]+math.sin(i*dr)*diameter/2
-    #         ps.append((x,y))
-    #     circ=rendering.FilledPolygon(ps)
-    #     circ.set_color(fill[0],fill[1],fill[2])
-    #     circ.add_attr(rendering.Transform())
-    #     self.viewer.add_onetime(circ)
     
-    # def initColors(self):
-    #     # c={a+1:hsv_to_rgb_numpy(a/float(self.num_agents),1,1) for a in range(self.num_agents)}
-    #     # return c
-    #     c={a+1:hsv_to_rgb(np.array([a/float(self.num_agents),1,1])) for a in range(self.num_agents)}
-    #     return c
-
-    # def _render(self, mode='human',close=False,screen_width=800,screen_height=800,action_probs=None):
-    #     if close == True:
-    #         return
-    #     #values is an optional parameter which provides a visualization for the value of each agent per step
-    #     size=screen_width/max(self.world.state.shape[0],self.world.state.shape[1])
-    #     colors=self.initColors()
-    #     if self.viewer==None:
-    #         self.viewer=rendering.Viewer(screen_width,screen_height)
-    #         self.reset_renderer=True
-    #     if self.reset_renderer:
-    #         self.create_rectangle(0,0,screen_width,screen_height,(.6,.6,.6),permanent=True)
-    #         for i in range(self.world.state.shape[0]):
-    #             start=0
-    #             end=1
-    #             scanning=False
-    #             write=False
-    #             for j in range(self.world.state.shape[1]):
-    #                 if(self.world.state[i,j]!=-1 and not scanning):#free
-    #                     start=j
-    #                     scanning=True
-    #                 if((j==self.world.state.shape[1]-1 or self.world.state[i,j]==-1) and scanning):
-    #                     end=j+1 if j==self.world.state.shape[1]-1 else j
-    #                     scanning=False
-    #                     write=True
-    #                 if write:
-    #                     x=i*size
-    #                     y=start*size
-    #                     self.create_rectangle(x,y,size,size*(end-start),(1,1,1),permanent=True)
-    #                     write=False
-    #     for agent in range(1,self.num_agents+1):
-    #         i,j=self.world.getPos(agent)
-    #         x=i*size
-    #         y=j*size
-    #         color=colors[self.world.state[i,j]]
-    #         self.create_rectangle(x,y,size,size,color)
-    #         i,j=self.world.getGoal(agent)
-    #         x=i*size
-    #         y=j*size
-    #         color=colors[self.world.goals[i,j]]
-    #         self.create_circle(x,y,size,size,color)
-    #         if self.world.getGoal(agent)==self.world.getPos(agent):
-    #             color=(0,0,0)
-    #             self.create_circle(x,y,size,size,color)
-    #     if action_probs is not None:
-    #         n_moves=9 if self.DIAGONAL_MOVEMENT else 5
-    #         for agent in range(1,self.num_agents+1):
-    #             #take the a_dist from the given data and draw it on the frame
-    #             a_dist=action_probs[agent-1]
-    #             if a_dist is not None:
-    #                 for m in range(n_moves):
-    #                     dx,dy=self.world.getDir(m)
-    #                     x=(self.world.getPos(agent)[0]+dx)*size
-    #                     y=(self.world.getPos(agent)[1]+dy)*size
-    #                     s=a_dist[m]*size
-    #                     self.create_circle(x,y,s,size,(0,0,0))
-    #     self.reset_renderer=False
-    #     result=self.viewer.render(return_rgb_array = mode=='rgb_array')
-    #     return result
+def worker(agent_id,env,episode_count,lock,barrier):
+    
+    cur_pos=env.getPositions()
+    goals=env.getGoals()
+    # print("before step agent=",agent_id,cur_pos,goals)
+    print("before step") 
+    barrier.wait()
+    with lock:
+        observation  = env._observe(agent_id)
+        validActions = env._listNextValidActions(agent_id)
+        a=random.choice(validActions[agent_id].tolist())
+    
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    barrier.wait()
+    with lock:
+        state, reward, done, nextActions, on_goal, blocking, valid_action=env._step((agent_id,a))
+    barrier.wait()
+    print("after 1 step") 
+    with lock:
+        validActions = env._listNextValidActions(agent_id,a)
+        a=random.choice(validActions[agent_id].tolist())
+        observation=env._observe(agent_id)
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    barrier.wait()
+    # cur_pos=env.getPositions()
+    # goals=env.getGoals()
+    # print("after step agent=",agent_id,cur_pos,goals)
+    if agent_id==2:
+        env._reset(agent_id)
+    
+    barrier.wait()
+    print("after reset")
+    with lock:
+        observation=env._observe(agent_id)
+    barrier.wait()
+    print("for agent",agent_id,"=",observation)
+    
 
 if __name__=='__main__':
-    n_agents=2
-    env=MAPFEnv(n_agents,PROB=(.3,.5),SIZE=(10,11),DIAGONAL_MOVEMENT=False)
-    print(env)
+    num_agents=2
+    env=MAPFEnv(num_agents,PROB=(.3,.5),SIZE=(10,11),DIAGONAL_MOVEMENT=False)
+    world=env.world
+    episode_count=mp.Value('i', 0)
+    lock = mp.Lock()
+    barrier = mp.Barrier(num_agents)
+    
+    
+    processes = []
+    for agent_id in range(1,num_agents+1):
+        print(f'worker {agent_id}: started')
+        p = mp.Process(target=worker, args=(agent_id,env,episode_count,lock,barrier))
+        p.start()
+        processes.append(p)
+    
+    for p in processes:
+        p.join()
